@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Node dependencies
+node_modules/
+package-lock.json
+
+# Screenshots & Media
+*.png
+*.mp4
+video_info.json
+quiz_answers.json
+
+# Temporary / system files
+.gemini/
+.system_generated/
+scratch/
