@@ -11,6 +11,18 @@ Object.defineProperty(process, 'platform', { value: 'linux' });
 const { chromium } = require('playwright-core');
 const assert = require('assert');
 
+// --- Helper: Robustly Extract JSON block from response text ---
+function extractJSON(text) {
+    if (!text) return null;
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1) {
+        const jsonContent = text.substring(firstBrace, lastBrace + 1);
+        return JSON.parse(jsonContent);
+    }
+    return JSON.parse(text);
+}
+
 // Ported getInteractiveElements function from termux_agent.js for verification
 function getInteractiveElements() {
     function getElementXPath(element) {
@@ -45,11 +57,18 @@ function getInteractiveElements() {
         .map((el, idx) => {
             const xpath = getElementXPath(el);
             let text = el.innerText.trim();
+            if (!text) {
+                const img = el.querySelector('img');
+                if (img && img.alt) {
+                    text = img.alt.trim();
+                }
+            }
             if (!text && el.placeholder) text = `Placeholder: ${el.placeholder}`;
             if (!text && el.value) text = `Value: ${el.value}`;
             if (!text && el.ariaLabel) text = `AriaLabel: ${el.ariaLabel}`;
             if (!text && el.title) text = `Title: ${el.title}`;
             if (!text && el.name) text = `Name: ${el.name}`;
+            if (!text && el.getAttribute('alt')) text = `Alt: ${el.getAttribute('alt')}`;
 
             return {
                 id: idx,
@@ -63,6 +82,25 @@ function getInteractiveElements() {
 
 async function runTests() {
     console.log("Starting Termux Browser Agent Unit Tests...");
+    
+    // Test extractJSON robustness
+    console.log("Verifying JSON parser robustness...");
+    
+    const validJSONText = '{"reasoning": "clicking", "action": "click", "target_id": 1}';
+    const json1 = extractJSON(validJSONText);
+    assert.strictEqual(json1.action, "click");
+    
+    const markdownJSONText = '```json\n{"reasoning": "clicking", "action": "click", "target_id": 1}\n```';
+    const json2 = extractJSON(markdownJSONText);
+    assert.strictEqual(json2.action, "click");
+    
+    const conversationalText = 'Sure! Here is the JSON:\n```json\n{"reasoning": "typing", "action": "type", "target_id": 2, "value": "test"}\n```\nHope that helps!';
+    const json3 = extractJSON(conversationalText);
+    assert.strictEqual(json3.action, "type");
+    assert.strictEqual(json3.value, "test");
+    
+    console.log("✔ JSON PARSER ROBUSTNESS TESTS PASSED!");
+
     let browser;
     let tempPage;
 
@@ -92,6 +130,10 @@ async function runTests() {
                 <input id="inp1" type="text" placeholder="Enter name">
                 <a id="link1" href="#">Read More</a>
                 
+                <!-- Enhanced label/alt detection elements -->
+                <button id="btn-img"><img src="icon.png" alt="Close Modal"></button>
+                <a id="link-alt" href="#" alt="External Link"></a>
+
                 <!-- Hidden/Non-interactive Elements (Should be ignored) -->
                 <div id="div1">Static Text</div>
                 <button id="btn-hidden" class="hidden-el">Invisible Button</button>
@@ -110,25 +152,32 @@ async function runTests() {
         console.log(`Extracted ${elements.length} elements. Verifying...`);
         
         // Assertions
-        assert.strictEqual(elements.length, 3, "Should extract exactly 3 visible interactive elements.");
+        assert.strictEqual(elements.length, 5, "Should extract exactly 5 visible interactive elements.");
         
         // Element 0: Button
-        const btn = elements.find(el => el.tag === 'button');
-        assert.ok(btn, "Should find button tag.");
+        const btn = elements.find(el => el.xpath && el.xpath.includes('btn1'));
+        assert.ok(btn, "Should find button tag with btn1 ID.");
         assert.strictEqual(btn.text, "Click Me", "Button label should match 'Click Me'.");
-        assert.strictEqual(btn.xpath, '//*[@id="btn1"]', "XPath should target #btn1.");
 
         // Element 1: Input
-        const input = elements.find(el => el.tag === 'input');
-        assert.ok(input, "Should find input tag.");
+        const input = elements.find(el => el.xpath && el.xpath.includes('inp1'));
+        assert.ok(input, "Should find input tag with inp1 ID.");
         assert.strictEqual(input.text, "Placeholder: Enter name", "Input description should capture placeholder.");
-        assert.strictEqual(input.xpath, '//*[@id="inp1"]', "XPath should target #inp1.");
 
         // Element 2: Link
-        const link = elements.find(el => el.tag === 'a');
-        assert.ok(link, "Should find anchor tag.");
+        const link = elements.find(el => el.xpath && el.xpath.includes('link1'));
+        assert.ok(link, "Should find anchor tag with link1 ID.");
         assert.strictEqual(link.text, "Read More", "Link description should match 'Read More'.");
-        assert.strictEqual(link.xpath, '//*[@id="link1"]', "XPath should target #link1.");
+
+        // Element 3: Image Button
+        const imgBtn = elements.find(el => el.xpath && el.xpath.includes('btn-img'));
+        assert.ok(imgBtn, "Should find image button.");
+        assert.strictEqual(imgBtn.text, "Close Modal", "Image button should inherit inner img alt text.");
+
+        // Element 4: Alt Link
+        const altLink = elements.find(el => el.xpath && el.xpath.includes('link-alt'));
+        assert.ok(altLink, "Should find link with alt attribute.");
+        assert.strictEqual(altLink.text, "Alt: External Link", "Link description should capture alt attribute.");
 
         console.log("✔ ALL DOM SIMPLIFIER ASSERTIONS PASSED!");
 

@@ -14,6 +14,7 @@ Object.defineProperty(process, 'platform', { value: 'linux' });
 const { chromium } = require('playwright-core');
 const { execSync } = require('child_process');
 const https = require('https');
+const http = require('http');
 
 // --- Helper: Wake Chrome & Setup ADB Port Forwarding ---
 async function wakeChromeAndForward() {
@@ -23,8 +24,9 @@ async function wakeChromeAndForward() {
         try {
             const devices = execSync('adb devices').toString().trim().split('\n').slice(1);
             const activeSerials = devices
+                .filter(line => line.includes('\tdevice') || line.endsWith('\tdevice'))
                 .map(line => line.split('\t')[0].trim())
-                .filter(serial => serial.length > 0 && !serial.includes('offline'));
+                .filter(serial => serial.length > 0);
                 
             if (activeSerials.length > 0) {
                 const device = activeSerials[0];
@@ -33,9 +35,15 @@ async function wakeChromeAndForward() {
                 execSync(`adb -s ${device} forward tcp:9222 localabstract:chrome_devtools_remote`);
             } else {
                 console.error('ADB: No serials found in adb devices, attempting fallback loopback connection...');
-                execSync('adb connect 127.0.0.1:44157').catch(() => {});
-                execSync('adb forward tcp:9222 localabstract:chrome_devtools_remote');
-                execSync('adb shell monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1').catch(() => {});
+                try {
+                    execSync('adb connect 127.0.0.1:44157');
+                } catch (e) {}
+                try {
+                    execSync('adb forward tcp:9222 localabstract:chrome_devtools_remote');
+                } catch (e) {}
+                try {
+                    execSync('adb shell monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1');
+                } catch (e) {}
             }
             await new Promise(resolve => setTimeout(resolve, 2000));
         } catch (e) {
@@ -46,14 +54,34 @@ async function wakeChromeAndForward() {
     }
 }
 
-// --- Helper: Native HTTPS POST to Gemini API ---
+// --- Helper: Native HTTPS POST to Gemini API / Vertex AI ---
 function callGemini(apiKey, model, prompt) {
     return new Promise((resolve, reject) => {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        let url;
+        const isVertex = apiKey.startsWith('AQ.') || process.env.VERTEX_PROJECT_ID;
+        
+        let targetModel = model;
+        if (isVertex) {
+            const project = process.env.VERTEX_PROJECT_ID || 'gen-lang-client-0471281580';
+            let location = process.env.VERTEX_LOCATION;
+            if (!location) {
+                if (targetModel.includes('3.5')) {
+                    location = 'global';
+                } else {
+                    location = 'us-central1';
+                }
+            }
+            const domain = location === 'global' ? 'aiplatform.googleapis.com' : (location === 'us' ? 'aiplatform.us.rep.googleapis.com' : `${location}-aiplatform.googleapis.com`);
+            url = `https://${domain}/v1/projects/${project}/locations/${location}/publishers/google/models/${targetModel}:generateContent?key=${apiKey}`;
+            console.error(`[Vertex AI] Using Model: ${targetModel}, Region: ${location}, Project: ${project}, Domain: ${domain}`);
+        } else {
+            url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`;
+        }
         
         const payload = {
             contents: [
                 {
+                    role: "user",
                     parts: [
                         { text: prompt }
                     ]
@@ -81,10 +109,10 @@ function callGemini(apiKey, model, prompt) {
                         const parsed = JSON.parse(body);
                         resolve(parsed);
                     } catch (e) {
-                        reject(new Error(`Failed to parse Gemini API JSON response: ${e.message}`));
+                        reject(new Error(`Failed to parse API JSON response: ${e.message}`));
                     }
                 } else {
-                    reject(new Error(`Gemini API Error (status ${res.statusCode}): ${body}`));
+                    reject(new Error(`API Error (status ${res.statusCode}): ${body}`));
                 }
             });
         });
@@ -93,6 +121,18 @@ function callGemini(apiKey, model, prompt) {
         req.write(data);
         req.end();
     });
+}
+
+// --- Helper: Robustly Extract JSON block from response text ---
+function extractJSON(text) {
+    if (!text) return null;
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1) {
+        const jsonContent = text.substring(firstBrace, lastBrace + 1);
+        return JSON.parse(jsonContent);
+    }
+    return JSON.parse(text);
 }
 
 // --- Browser DOM Extractor (Injected Client-Side) ---
@@ -132,11 +172,19 @@ function getInteractiveElements() {
             
             // Extract descriptive text / label
             let text = el.innerText.trim();
+            if (!text) {
+                // If there's an image inside, check its alt text
+                const img = el.querySelector('img');
+                if (img && img.alt) {
+                    text = img.alt.trim();
+                }
+            }
             if (!text && el.placeholder) text = `Placeholder: ${el.placeholder}`;
             if (!text && el.value) text = `Value: ${el.value}`;
             if (!text && el.ariaLabel) text = `AriaLabel: ${el.ariaLabel}`;
             if (!text && el.title) text = `Title: ${el.title}`;
             if (!text && el.name) text = `Name: ${el.name}`;
+            if (!text && el.getAttribute('alt')) text = `Alt: ${el.getAttribute('alt')}`;
 
             return {
                 id: idx,
@@ -146,6 +194,83 @@ function getInteractiveElements() {
                 xpath: xpath
             };
         });
+}
+
+function httpGet(url) {
+    return new Promise((resolve, reject) => {
+        http.get(url, (res) => {
+            let body = '';
+            res.on('data', chunk => body += chunk);
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(body));
+                } catch (e) {
+                    resolve(body);
+                }
+            });
+        }).on('error', reject);
+    });
+}
+
+async function sanitizeAndConnect(navigateUrl) {
+    // 1. Ensure ADB port forwarding is configured
+    await wakeChromeAndForward();
+    
+    // 2. Open the target page directly via ADB intent to bring Chrome to front cleanly
+    const targetUrl = navigateUrl || "https://www.google.com";
+    try {
+        const devices = execSync('adb devices').toString().trim().split('\n').slice(1);
+        const activeSerials = devices
+            .filter(line => line.includes('\tdevice') || line.endsWith('\tdevice'))
+            .map(line => line.split('\t')[0].trim())
+            .filter(serial => serial.length > 0);
+            
+        if (activeSerials.length > 0) {
+            const device = activeSerials[0];
+            console.error(`ADB: Clean opening URL ${targetUrl} on device [${device}]`);
+            execSync(`adb -s ${device} shell am start -n com.android.chrome/com.google.android.apps.chrome.Main -d "${targetUrl}"`);
+        } else {
+            console.error(`ADB: Fallback opening URL ${targetUrl}`);
+            execSync(`adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main -d "${targetUrl}"`);
+        }
+    } catch (e) {
+        console.error(`ADB intent startup warning: ${e.message}`);
+    }
+    
+    // Settle wait
+    await new Promise(r => setTimeout(r, 3000));
+    
+    // 3. Force-close other active tabs or service workers to prevent Playwright targets discovery from hanging
+    try {
+        const tabs = await httpGet('http://localhost:9222/json/list');
+        if (Array.isArray(tabs) && tabs.length > 0) {
+            console.error(`CDP Sanitizer: Found ${tabs.length} open targets. Isolating active workspace...`);
+            
+            // Resolve keeping target
+            let keepTab = tabs.find(tab => tab.type === 'page' && tab.url && (tab.url.toLowerCase().includes('google.com') || (navigateUrl && tab.url.toLowerCase().includes(navigateUrl.toLowerCase().split('/')[2]))));
+            if (!keepTab) {
+                keepTab = tabs.find(tab => tab.type === 'page' && tab.url);
+            }
+            
+            if (keepTab) {
+                console.error(`CDP Sanitizer: Preserving active target ID ${keepTab.id} (${keepTab.title})`);
+                for (const tab of tabs) {
+                    if (tab.id !== keepTab.id && (tab.type === 'page' || tab.type === 'worker')) {
+                        console.error(`CDP Sanitizer: Terminating background target ID ${tab.id} (${tab.title || 'Untitled'})`);
+                        await httpGet(`http://localhost:9222/json/close/${tab.id}`).catch(() => {});
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.error(`CDP Sanitizer warning: Tab sanitation bypassed: ${e.message}`);
+    }
+    
+    await new Promise(r => setTimeout(r, 1000));
+    
+    // 4. Connect Playwright cleanly
+    console.error("CDP: Initializing Playwright CDP Handshake...");
+    return await chromium.connectOverCDP('http://localhost:9222');
 }
 
 // --- Main Agent Loop ---
@@ -165,11 +290,8 @@ async function runAgent(task, urlKeyword, navigateUrl) {
 
     let browser;
     try {
-        // Connect over CDP
-        browser = await chromium.connectOverCDP('http://localhost:9222').catch(async () => {
-            await wakeChromeAndForward();
-            return await chromium.connectOverCDP('http://localhost:9222');
-        });
+        // Connect over CDP with sanitation
+        browser = await sanitizeAndConnect(navigateUrl);
 
         const contexts = browser.contexts();
         if (contexts.length === 0) throw new Error("No active browser contexts found.");
@@ -253,13 +375,7 @@ Respond ONLY with a valid raw JSON object matching this schema (no markdown form
                 console.log("Querying Gemini API for next step...");
                 const response = await callGemini(apiKey, model, prompt);
                 let responseText = response.candidates[0].content.parts[0].text.trim();
-                
-                // Clean markdown code blocks if the model ignored responseMimeType restriction
-                if (responseText.startsWith('```')) {
-                    responseText = responseText.replace(/^```json\s*/, '').replace(/```$/, '').trim();
-                }
-                
-                geminiJson = JSON.parse(responseText);
+                geminiJson = extractJSON(responseText);
             } catch (e) {
                 console.error("Gemini Response parsing failure. Raw text returned:", e.message);
                 lastActionFeedback = `Failed to get a valid JSON plan from the LLM. Error: ${e.message}. Retrying...`;
@@ -294,47 +410,87 @@ Respond ONLY with a valid raw JSON object matching this schema (no markdown form
                 await new Promise(r => setTimeout(r, 300 + Math.random() * 300));
 
                 if (geminiJson.action === 'click') {
-                    // Level-3 Fast-Path: Try direct browser-side DOM click first (0ms delay, bypasses layout occlusion)
-                    const directClicked = await page.evaluate((xpath) => {
-                        const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                        if (el) {
-                            el.click();
-                            return true;
-                        }
-                        return false;
-                    }, target.xpath);
+                    let clicked = false;
 
-                    if (directClicked) {
-                        lastActionFeedback = `Successfully clicked element via Direct DOM Click (Fast-Path).`;
-                    } else {
-                        // Level-2 Fallback: Standard Playwright mouse click
-                        await locator.click({ timeout: 5000 });
+                    // Tier 1: Standard Playwright click (simulates actual human events, triggers framework listeners)
+                    try {
+                        await locator.click({ timeout: 2000 });
                         lastActionFeedback = `Successfully clicked element via standard Playwright click.`;
+                        clicked = true;
+                    } catch (err) {
+                        console.warn(`Standard click failed (ID: ${geminiJson.target_id}): ${err.message}. Trying Tier 2 mouse click...`);
+                    }
+
+                    // Tier 2: Mouse center-point coordinates click (bypasses layout occlusions/overlays)
+                    if (!clicked) {
+                        try {
+                            const box = await locator.boundingBox();
+                            if (box) {
+                                await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                                lastActionFeedback = `Successfully clicked element via Mouse Coordinates click (Tier 2).`;
+                                clicked = true;
+                            } else {
+                                console.warn(`Element bounding box is null (ID: ${geminiJson.target_id}).`);
+                            }
+                        } catch (err) {
+                            console.warn(`Mouse coordinate click failed (ID: ${geminiJson.target_id}): ${err.message}. Trying Tier 3 Direct DOM click...`);
+                        }
+                    }
+
+                    // Tier 3: Direct JS DOM element.click() fallback (forces execution even if hidden/covered)
+                    if (!clicked) {
+                        const directClicked = await page.evaluate((xpath) => {
+                            const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                            if (el) {
+                                el.click();
+                                return true;
+                            }
+                            return false;
+                        }, target.xpath);
+
+                        if (directClicked) {
+                            lastActionFeedback = `Successfully clicked element via Direct DOM Click fallback (Tier 3).`;
+                            clicked = true;
+                        } else {
+                            throw new Error("Element could not be resolved in DOM for Direct Click.");
+                        }
                     }
                 } else if (geminiJson.action === 'type') {
-                    // Level-3 Fast-Path: Try direct DOM value assignment & input dispatch (Fast & Accurate)
-                    const directTyped = await page.evaluate(({ xpath, value }) => {
-                        const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                        if (el) {
-                            el.focus();
-                            el.value = value;
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                            return true;
-                        }
-                        return false;
-                    }, { xpath: target.xpath, value: geminiJson.value });
+                    let typed = false;
 
-                    if (directTyped) {
-                        lastActionFeedback = `Successfully filled text via Direct DOM Input (Fast-Path).`;
-                    } else {
-                        // Level-2 Fallback: Standard Playwright keyboard typing simulation
+                    // Tier 1: Standard Playwright fill/typing (triggers React/Vue virtual DOM updates)
+                    try {
                         await locator.focus();
-                        await locator.fill('');
+                        await locator.fill('', { timeout: 2000 });
                         for (const char of geminiJson.value) {
-                            await page.keyboard.type(char, { delay: 40 + Math.random() * 50 });
+                            await page.keyboard.type(char, { delay: 30 + Math.random() * 40 });
                         }
                         lastActionFeedback = `Successfully filled text via standard keyboard typing simulation.`;
+                        typed = true;
+                    } catch (err) {
+                        console.warn(`Standard typing failed (ID: ${geminiJson.target_id}): ${err.message}. Trying Tier 2 Direct DOM Input...`);
+                    }
+
+                    // Tier 2: Direct DOM value assignment & input dispatch (Fast & Accurate fallback)
+                    if (!typed) {
+                        const directTyped = await page.evaluate(({ xpath, value }) => {
+                            const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                            if (el) {
+                                el.focus();
+                                el.value = value;
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                return true;
+                            }
+                            return false;
+                        }, { xpath: target.xpath, value: geminiJson.value });
+
+                        if (directTyped) {
+                            lastActionFeedback = `Successfully filled text via Direct DOM Input fallback (Tier 2).`;
+                            typed = true;
+                        } else {
+                            throw new Error("Element could not be resolved in DOM for Direct Input assignment.");
+                        }
                     }
                 } else if (geminiJson.action === 'select') {
                     await locator.selectOption(geminiJson.value);
