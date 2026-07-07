@@ -328,12 +328,36 @@ async function runAgent(task, urlKeyword, navigateUrl) {
         while (step <= maxSteps) {
             console.log(`\n================ STEP ${step} ================`);
             const currentUrl = page.url();
-            const currentTitle = await page.title();
+            let currentTitle = "";
+            try {
+                currentTitle = await page.title();
+            } catch (e) {
+                currentTitle = "Loading...";
+            }
             console.log(`Current URL: ${currentUrl}`);
             console.log(`Current Title: "${currentTitle}"`);
 
             // Extract visible interactive elements
-            const elements = await page.evaluate(getInteractiveElements);
+            let elements = [];
+            try {
+                elements = await page.evaluate(getInteractiveElements);
+            } catch (evalErr) {
+                const isNavError = evalErr.message.includes('context was destroyed') || 
+                                   evalErr.message.includes('navigation') || 
+                                   evalErr.message.includes('Execution context');
+                if (isNavError) {
+                    console.log("Navigation/load detected during element extraction. Waiting 4 seconds for stabilization...");
+                    await new Promise(r => setTimeout(r, 4000));
+                    try {
+                        elements = await page.evaluate(getInteractiveElements);
+                    } catch (retryErr) {
+                        console.log("Extraction retry also failed, using empty elements array.");
+                        elements = [];
+                    }
+                } else {
+                    throw evalErr;
+                }
+            }
             console.log(`Extracted ${elements.length} visible interactive elements.`);
 
             if (elements.length === 0) {
