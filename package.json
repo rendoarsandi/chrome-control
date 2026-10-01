@@ -1,16 +1,23 @@
 {
   "name": "chrome-control",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "2.0.0",
+  "description": "Local MCP tools for Android Chrome over ADB/CDP. No AI API key required.",
+  "bin": {
+    "chrome-control-mcp": "bin/chrome-control-mcp.mjs",
+    "chrome-control-cli": "chrome-control-cli"
+  },
+  "engines": { "node": ">=20" },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bin/chrome-control-mcp.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
   "dependencies": {
-    "playwright-core": "^1.60.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright-core": "^1.60.0",
+    "zod": "^3.25.76"
   }
 }
