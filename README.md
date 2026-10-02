@@ -142,6 +142,16 @@ References retain actual DOM nodes. A layout change cannot silently turn an old 
 
 Tools return JSON text and structured results; screenshots additionally return MCP image content. Errors have `isError: true` and an error code, message, and recovery guidance. Requests are serialized and bounded. On a request timeout, the connection is reset; inspect the page before repeating an action because it may have executed. Startup and tool discovery work even when Chrome is unavailable. Normal stdio output contains only MCP messages.
 
+### Recover without restarting Codex
+
+Call `browser_status` with `{"reconnect":true}` to discard a stalled CDP connection and repair ADB forwarding. For a wireless device, this disconnects and reconnects only the selected ADB address using existing authorization. Chrome and its tabs remain open. Select the intended tab again and use fresh snapshot refs after reconnecting.
+
+When Android changes its wireless debugging connection port, supply the new address: `browser_status({"android_serial":"192.168.100.14:41803"})`. The server reconnects that explicit device with existing ADB authorization and remembers the choice for subsequent requests. Use the connection port from Android's Wireless debugging screen, not its pairing port. No MCP configuration change or Codex restart is needed for these connection changes.
+
+Tab discovery reads Chrome's target metadata without evaluating every page. A paused background renderer cannot block actions in a healthy selected tab. Snapshot reads have frame deadlines; an unresponsive child frame produces a warning, while an unresponsive main frame resets the connection. Element cleanup does not block subsequent tools. Attaching preserves Chrome's existing focus, media and download settings.
+
+Only untargeted reads (`browser_status` and `browser_tabs`) can automatically retry after a connection failure. Clicks, submissions, navigation and evaluation are never automatically repeated. Errors include `may_have_executed` when input may have been sent and `executed` when the operation completed before observation failed. Inspect the page before repeating it.
+
 JavaScript dialogs remain open for the assistant to inspect and explicitly accept or dismiss. A snapshot reports the dialog's type, message and default prompt value. Page actions are blocked until it is handled.
 
 ## Configuration
@@ -160,9 +170,11 @@ JavaScript dialogs remain open for the assistant to inspect and explicitly accep
 
 - **Assistant writes Python instead of using tools:** check its MCP server list, reload the configuration, and explicitly ask it to use the `chrome-control` tools. This repository's `AGENTS.md` also describes that workflow.
 - **Device unavailable:** check `adb devices`, repeat `adb connect` with the current wireless debugging connection port, and keep Chrome open. Pair again if Android revoked authorization.
+- **Connection stalled or port changed:** call `browser_status` with `reconnect: true`, or supply the current address as `android_serial`. This repairs the connection inside the running MCP server. Source code updates still require reloading the MCP server once to load the new version; subsequent connection repairs do not require restarting Codex.
 - **Wrong tab:** use `browser_tabs` and `browser_select_tab`. Android does not expose a dependable active-tab flag through ordinary CDP discovery.
 - **Page still loading:** inspect again with `browser_wait`. If text or elements are truncated, increase `browser_snapshot` limits or scroll to the relevant area.
 - **Blank tool response or long pause:** the client should surface the error within the configured request deadline. Set its tool timeout above that deadline (45 seconds for the default 30 seconds).
+- **Clicks stall while snapshots work:** Android can pause animation frames even while CDP and JavaScript timers respond. For main-frame controls, the server uses timer-based geometry checks and native mouse input after checking visibility, disabled state and hit testing. If the target is covered or moving, or belongs to an iframe with paused rendering, keep Chrome in the foreground with the screen unlocked and inspect again before retrying.
 - **Controls absent from the snapshot:** open shadow roots and web frames are supported. Closed shadow roots, canvas UI, and Chrome's native menus may require visual interaction or manual input. CDP controls web content; it does not automate Android system dialogs or Chrome's native address bar.
 - **Termux pauses when Chrome opens:** Android may suspend or kill background apps. Samsung battery settings and `termux-wake-lock` can help keep Termux active; memory usage and survival depend on the device and OS settings.
 
@@ -176,6 +188,6 @@ npm test
 CHROME_TEST_EXECUTABLE=/usr/bin/chromium npm test
 ```
 
-The default tests exercise MCP discovery without Chrome, connection errors, ADB device selection, configuration, and deadlines. Setting `CHROME_TEST_EXECUTABLE` additionally runs real browser tests through an MCP stdio client, including page actions, iframes, shadow DOM, stale refs after removal and manual navigation, screenshots, dialogs, recovery from a stalled request, and preservation of tabs after disconnect. The server does not download a test browser. Desktop tests do not verify Samsung's wireless debugging or Termux process lifecycle.
+The default tests exercise MCP discovery without Chrome, connection errors, ADB device selection, wireless reconnection arguments, cancellation, configuration, and deadlines. Setting `CHROME_TEST_EXECUTABLE` additionally runs real browser tests through an MCP stdio client, including page actions, iframes, shadow DOM, stale refs after removal and manual navigation, screenshots, dialogs, a paused background renderer, explicit reconnect without restarting the MCP client, recovery from a stalled mutation without replaying it, and preservation of tabs after disconnect. The server does not download a test browser. Desktop tests do not verify Samsung's wireless debugging or Termux process lifecycle.
 
 Version 2 replaces the Gemini agent, Python dependencies, and course/survey solvers with a reusable MCP server. `chrome-control-cli` is now a compatibility entry point for the MCP server. Old flags such as `--solve-course`, `--get-text`, and `--interactive` are removed; clients call the browser tools instead. Configure your existing AI assistant rather than launching `termux_agent.js` or supplying `GEMINI_API_KEY`.

@@ -60,5 +60,5 @@ export function collectDOM({ maxElements, maxText }) {
     nodes.push(element);
   }
   const text = [document.body?.innerText || '', ...shadowText].join('\n').trim();
-  return { nodes, data: { text: text.slice(0, maxText), text_truncated: text.length > maxText, elements, elements_truncated: total > elements.length } };
+  return { nodes, data: { title: document.title, text: text.slice(0, maxText), text_truncated: text.length > maxText, elements, elements_truncated: total > elements.length } };
 }
