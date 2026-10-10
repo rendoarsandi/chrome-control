@@ -150,6 +150,8 @@ When Android changes its wireless debugging connection port, supply the new addr
 
 Tab discovery reads Chrome's target metadata without evaluating every page. A paused background renderer cannot block actions in a healthy selected tab. Snapshot reads have frame deadlines; an unresponsive child frame produces a warning, while an unresponsive main frame resets the connection. Element cleanup does not block subsequent tools. Attaching preserves Chrome's existing focus, media and download settings.
 
+Chrome may expose native or not-yet-navigated targets with an empty URL. These are left open and skipped during attachment so they cannot block usable web tabs. They become available when Chrome reports a page URL. New tabs are created with their requested destination directly; if Chrome creates a tab but does not expose its page, the tool reports that outcome so you can inspect before retrying.
+
 Only untargeted reads (`browser_status` and `browser_tabs`) can automatically retry after a connection failure. Clicks, submissions, navigation and evaluation are never automatically repeated. Errors include `may_have_executed` when input may have been sent and `executed` when the operation completed before observation failed. Inspect the page before repeating it.
 
 JavaScript dialogs remain open for the assistant to inspect and explicitly accept or dismiss. A snapshot reports the dialog's type, message and default prompt value. Page actions are blocked until it is handled.

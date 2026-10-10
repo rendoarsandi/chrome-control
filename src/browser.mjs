@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { canForward, forwardChrome } from './adb.mjs';
+import { connectTransport } from './cdp-transport.mjs';
 import { collectDOM } from './dom.mjs';
 import { ControlError, describeError, withDeadline } from './errors.mjs';
 
@@ -49,7 +50,17 @@ export class BrowserController {
     this.selected = null;
     const open = async timeout => {
       this.assertActive();
-      const browser = await this.chromium.connectOverCDP(this.config.endpoint, { timeout, noDefaults: true });
+      const started = Date.now();
+      const transport = await connectTransport(this.config.endpoint, { timeout, signal: this.abort.signal });
+      let browser;
+      try {
+        this.assertActive();
+        browser = await this.chromium.connectOverCDP(transport, { timeout: Math.max(1, timeout - (Date.now() - started)), noDefaults: true });
+      } catch (error) {
+        transport.close();
+        error.cdpConnected = true;
+        throw error;
+      }
       if (this.stopped) {
         browser.close().catch(() => {});
         this.assertActive();
@@ -84,7 +95,7 @@ export class BrowserController {
         }
       }
       if (!this.browser) {
-        const unresponsive = /<ws connected>/i.test(lastError.message);
+        const unresponsive = lastError.cdpConnected || /<ws connected>/i.test(lastError.message);
         throw new ControlError(unresponsive ? 'CDP_UNRESPONSIVE' : 'CDP_UNAVAILABLE',
           `ADB forwarding completed, but Chrome ${unresponsive ? 'did not finish CDP initialization' : 'is still unreachable'}: ${lastError.message}`,
           'Keep Chrome foregrounded with the screen unlocked, then call browser_status with reconnect: true. Check the current wireless debugging port and Chrome debugging socket.',
@@ -203,11 +214,28 @@ export class BrowserController {
     const context = browser.contexts()[0];
     if (!context) throw new ControlError('NO_CONTEXT', 'Chrome has no browser context.', 'Open Chrome and call browser_status.');
     this.noteInput('new_tab');
-    const page = await context.newPage();
+    if (!this.cdp) this.cdp = await browser.newBrowserCDPSession();
+    // Creating about:blank and then navigating can strand an Android native
+    // empty target before Playwright has a Page. Request the final URL first.
+    const { targetId } = await this.cdp.send('Target.createTarget', { url });
+    this.outcome.executed = true;
+    const page = await withDeadline(async () => {
+      while (true) {
+        this.assertActive();
+        await this.tabs();
+        for (const candidate of context.pages()) {
+          if (this.targets.get(candidate) === targetId) return candidate;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }, this.config.actionTimeout, new ControlError('SESSION_TIMEOUT',
+      'Chrome created a tab, but did not expose its page before the deadline.',
+      'Call browser_status and inspect the tab list before trying again. Keep Chrome foregrounded and the screen unlocked.',
+      { target_id: targetId }));
     this.assertActive();
     this.selected = this.register(page);
     this.outcome = { ...this.outcome, tab_id: this.selected, executed: true };
-    if (url !== 'about:blank') await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.config.actionTimeout });
+    if (url !== 'about:blank') await page.waitForLoadState('domcontentloaded', { timeout: this.config.actionTimeout });
     this.assertActive();
     await page.bringToFront();
     return this.snapshot({});

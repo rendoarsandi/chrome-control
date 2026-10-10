@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import WebSocket, { WebSocketServer } from 'ws';
 import { forwardChrome } from '../src/adb.mjs';
 import { readConfig } from '../src/config.mjs';
 import { withDeadline } from '../src/errors.mjs';
@@ -26,6 +27,120 @@ async function clientFor(env) {
     return { response, data };
   } };
 }
+
+async function startBrowser(executable, url = 'about:blank') {
+  const profile = await mkdtemp(join(tmpdir(), 'chrome-control-test-'));
+  const child = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--site-per-process', '--remote-debugging-port=0', `--user-data-dir=${profile}`, url], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const close = async () => {
+    child.kill('SIGTERM');
+    await new Promise(resolve => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
+      const timer = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 2000);
+      child.once('exit', () => { clearTimeout(timer); resolve(); });
+    });
+    await rm(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  };
+  try {
+    const endpoint = await new Promise((resolve, reject) => {
+      let logs = '';
+      const timer = setTimeout(() => reject(new Error(`Chromium startup timed out: ${logs.slice(-1000)}`)), 15000);
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.stderr.on('data', data => {
+        logs += data.toString();
+        const match = logs.match(/DevTools listening on (ws:\/\/\S+)/);
+        if (match) { clearTimeout(timer); resolve(match[1]); }
+      });
+    });
+    return { endpoint, close };
+  } catch (error) { await close(); throw error; }
+}
+
+test('MCP connects around an empty Chrome target and discovers it after navigation without closing tabs', { timeout: 30000 }, async t => {
+  const executable = process.env.CHROME_TEST_EXECUTABLE;
+  if (!executable) return t.skip('Set CHROME_TEST_EXECUTABLE to a desktop Chromium binary.');
+  const fixture = await startBrowser(executable, 'data:text/html,<title>Healthy page</title><h1>Available</h1>');
+  if (process.platform === 'android') Object.defineProperty(process, 'platform', { value: 'linux' });
+  const { chromium } = await import('playwright-core');
+  let observer;
+  let session;
+  const relay = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(resolve => relay.once('listening', resolve));
+  const pageSite = createHttpServer((_request, response) => {
+    response.setHeader('content-type', 'text/html');
+    response.end('<title>Created page</title><h1>Created</h1>');
+  });
+  await new Promise(resolve => pageSite.listen(0, '127.0.0.1', resolve));
+  const sockets = new Set();
+  try {
+    observer = await chromium.connectOverCDP(fixture.endpoint, { noDefaults: true, timeout: 5000 });
+    const context = observer.contexts()[0];
+    const blank = await context.newPage();
+    relay.on('connection', downstream => {
+      const upstream = new WebSocket(fixture.endpoint);
+      sockets.add(downstream); sockets.add(upstream);
+      const queue = [];
+      const blankSessions = new Set();
+      const frameTrees = new Set();
+      // Reproduce Android's native target using real Chromium protocol traffic:
+      // the target has an execution context, but no URL or subsequent navigation.
+      const empty = info => {
+        if (info?.type === 'page' && info.url === 'about:blank') info.url = '';
+      };
+      upstream.on('open', () => queue.splice(0).forEach(data => upstream.send(data)));
+      downstream.on('message', data => {
+        const text = data.toString();
+        const message = JSON.parse(text);
+        if (message.method === 'Page.getFrameTree' && blankSessions.has(message.sessionId)) frameTrees.add(message.id);
+        if (upstream.readyState === WebSocket.OPEN) upstream.send(text); else queue.push(text);
+      });
+      upstream.on('message', data => {
+        const message = JSON.parse(data.toString());
+        if (message.method === 'Target.attachedToTarget' && message.params.targetInfo.type === 'page' && message.params.targetInfo.url === 'about:blank') blankSessions.add(message.params.sessionId);
+        empty(message.params?.targetInfo);
+        if (frameTrees.delete(message.id) && message.result?.frameTree.frame.url === 'about:blank') message.result.frameTree.frame.url = '';
+        downstream.send(JSON.stringify(message));
+      });
+      upstream.on('error', () => downstream.terminate());
+      downstream.on('error', () => upstream.terminate());
+      downstream.on('close', () => upstream.terminate());
+      upstream.on('close', () => downstream.terminate());
+    });
+    session = await clientFor({ CHROME_CDP_URL: `ws://127.0.0.1:${relay.address().port}`, CHROME_AUTO_ADB: '0', CHROME_REQUEST_TIMEOUT_MS: '10000' });
+    const status = (await session.call('browser_status')).data;
+    assert.equal(status.ok, true, JSON.stringify(status));
+    assert.equal(status.tabs.length, 1);
+    assert.equal(status.tabs[0].title, 'Healthy page');
+    const snapshot = (await session.call('browser_select_tab', { tab_id: status.tabs[0].tab_id })).data;
+    assert(snapshot.frames[0].text.includes('Available'));
+    assert.equal(context.pages().length, 2, 'Skipping an empty target must preserve its real tab');
+    await blank.goto('data:text/html,<title>Restored page</title><h1>Restored</h1>');
+    let tabs;
+    const until = Date.now() + 4000;
+    do {
+      tabs = (await session.call('browser_tabs')).data.tabs;
+      if (tabs?.some(tab => tab.title === 'Restored page')) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } while (Date.now() < until);
+    assert.equal(tabs.length, 2);
+    const restored = tabs.find(tab => tab.title === 'Restored page');
+    assert(restored, JSON.stringify(tabs));
+    const observed = (await session.call('browser_select_tab', { tab_id: restored.tab_id })).data;
+    assert(observed.frames[0].text.includes('Restored'));
+    const created = (await session.call('browser_new_tab', { url: `http://127.0.0.1:${pageSite.address().port}` })).data;
+    assert.equal(created.ok, true, JSON.stringify(created));
+    assert(created.frames[0].text.includes('Created'));
+    await session.client.close();
+    session = null;
+    assert.equal(context.pages().length, 3, 'Disconnecting must preserve existing and newly created tabs');
+  } finally {
+    await session?.client.close();
+    for (const socket of sockets) socket.terminate();
+    await new Promise(resolve => relay.close(resolve));
+    await new Promise(resolve => pageSite.close(resolve));
+    await observer?.close();
+    await fixture.close();
+  }
+});
 
 test('MCP discovers tools without Chrome or API keys and gives actionable connection errors', async () => {
   const session = await clientFor({ CHROME_CDP_URL: 'http://127.0.0.1:1', CHROME_AUTO_ADB: '0', GEMINI_API_KEY: '', OPENAI_API_KEY: '', ANTHROPIC_API_KEY: '' });
@@ -105,21 +220,11 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
   });
   await new Promise(resolve => site.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${site.address().port}`;
-  const profile = await mkdtemp(join(tmpdir(), 'chrome-control-test-'));
-  const child = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--site-per-process', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const fixture = await startBrowser(executable);
   let session;
   let frameObserver;
   try {
-    const endpoint = await new Promise((resolve, reject) => {
-      let logs = '';
-      const timer = setTimeout(() => reject(new Error(`Chromium startup timed out: ${logs.slice(-1000)}`)), 15000);
-      child.once('error', error => { clearTimeout(timer); reject(error); });
-      child.stderr.on('data', data => {
-        logs += data.toString();
-        const match = logs.match(/DevTools listening on (ws:\/\/\S+)/);
-        if (match) { clearTimeout(timer); resolve(match[1]); }
-      });
-    });
+    const { endpoint } = fixture;
     session = await clientFor({ CHROME_CDP_URL: endpoint, CHROME_AUTO_ADB: '0', CHROME_REQUEST_TIMEOUT_MS: '10000', GEMINI_API_KEY: '' });
     const invoke = async (name, args = {}) => {
       const { data, response } = await session.call(name, args);
@@ -291,13 +396,7 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
   } finally {
     await frameObserver?.close();
     await session?.client.close();
-    child.kill('SIGTERM');
-    await new Promise(resolve => {
-      if (child.exitCode !== null) return resolve();
-      const timer = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 2000);
-      child.once('exit', () => { clearTimeout(timer); resolve(); });
-    });
     await new Promise(resolve => site.close(resolve));
-    await rm(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    await fixture.close();
   }
 });
