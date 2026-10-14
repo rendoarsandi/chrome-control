@@ -156,12 +156,13 @@ test('MCP discovers tools without Chrome or API keys and gives actionable connec
     assert.equal(data.error.code, 'CDP_UNAVAILABLE');
     assert.match(data.error.recovery, /CHROME_CDP_URL/);
     const execute = (code, options = {}) => session.call('browser_exec', { code, include_snapshot: false, ...options });
-    const first = await execute('const saved = await Promise.resolve(41); function next(value) { return value + 1; } print(saved);');
+    const first = await execute('const saved = await Promise.resolve(41); var stream = "User variable"; const events = 7; function next(value) { return value + 1; } print(saved);');
     assert.equal(first.data.ok, true, JSON.stringify(first.data));
     assert.equal(first.data.output, '41\n');
     const second = await execute('console.log(next(saved)); next(saved)');
     assert.equal(second.data.result, 42, 'Variables and functions must survive across MCP calls');
     assert.equal(second.data.output, '42\n');
+    assert.deepEqual((await execute('({stream,events})')).data.result, { stream: 'User variable', events: 7 }, 'Node builtin names must remain usable as ordinary persistent variables');
     const failed = await execute('print("Before failure"); throw new Error("Script failed")');
     assert.equal(failed.response.isError, true);
     assert.equal(failed.data.error.code, 'EXEC_ERROR');
@@ -178,6 +179,47 @@ test('MCP discovers tools without Chrome or API keys and gives actionable connec
     assert.equal((await execute('typeof saved')).data.result, 'undefined', 'A timed-out namespace must be discarded');
     assert.equal(session.stderr(), '');
   } finally { await session.client.close(); }
+});
+
+test('compact MCP keeps exec helpers and reloads explicitly saved functions across sessions', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'chrome-control-helpers-'));
+  const path = join(directory, 'helpers.js');
+  await writeFile(path, 'function savedHelper(value) { return value + 2; }');
+  const env = { CHROME_CDP_URL: 'http://127.0.0.1:1', CHROME_AUTO_ADB: '0', CHROME_TOOL_MODE: 'compact', CHROME_HELPER_FILES: JSON.stringify([path]) };
+  let session;
+  let full;
+  try {
+    session = await clientFor(env);
+    full = await clientFor({ ...env, CHROME_TOOL_MODE: 'full' });
+    const compactCatalog = await session.client.listTools();
+    const fullCatalog = await full.client.listTools();
+    assert.equal(compactCatalog.tools.length, 3);
+    assert(JSON.stringify(compactCatalog).length < JSON.stringify(fullCatalog).length / 2);
+    const execute = (code, options = {}) => session.call('browser_exec', { code, include_snapshot: false, ...options });
+    assert.equal((await execute('savedHelper(40)')).data.result, 42);
+    // Hidden tools remain callable inside exec rather than disappearing from
+    // the runtime namespace when removed from the public catalog.
+    const helper = await execute('await list_tabs()');
+    assert.equal(helper.data.error.code, 'CDP_UNAVAILABLE');
+    assert.equal(helper.data.steps[0].helper, 'list_tabs');
+    await writeFile(path, 'function savedHelper(value) { return value + 3; }');
+    assert.equal((await execute('savedHelper(40)')).data.result, 43);
+    await session.client.close();
+    session = await clientFor(env);
+    assert.equal((await execute('savedHelper(40)')).data.result, 43, 'Saved helpers must load after a fresh server launch');
+    const relative = await execute('1', { helper_files: ['helpers.js'] });
+    assert.equal(relative.data.error.code, 'HELPER_PATH_INVALID');
+    await writeFile(path, 'x'.repeat(65537));
+    assert.equal((await execute('1')).data.error.code, 'HELPER_FILE_LIMIT');
+    const reset = await execute('while (true) {}', { helper_files: [], timeout_ms: 300 });
+    assert.equal(reset.data.error.code, 'EXEC_TIMEOUT');
+    await writeFile(path, 'function savedHelper(value) { return value + 4; }');
+    assert.equal((await execute('savedHelper(40)')).data.result, 44, 'Helpers must rebuild after timeout resets the namespace');
+    assert.equal(session.stderr(), '');
+  } finally {
+    await session?.client.close(); await full?.client.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('ADB only chooses authorized devices and never guesses across multiple devices', async () => {
@@ -240,6 +282,7 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
   if (!executable) return t.skip('Set CHROME_TEST_EXECUTABLE to a desktop Chromium binary.');
   const site = createHttpServer((request, response) => {
     response.setHeader('content-type', 'text/html');
+    if (request.url === '/data') return setTimeout(() => { response.setHeader('content-type', 'application/json'); response.end('{"received":true}'); }, 350);
     if (request.url === '/frame') return response.end(`<label>Frame input <input aria-label="Frame input"></label>
       <input type="file" aria-label="Frame upload" style="display:none" onchange="this.files[0].text().then(text=>parent.postMessage({upload:text},'*'))">
       <button onclick="document.querySelector('input[type=file]').click()">Browse files</button>
@@ -258,6 +301,7 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
       <button onclick="document.querySelector('#bottom').remove()">Remove planned target</button>
       <button onclick="location.href='/other'">Navigate away</button>
       <button onclick="window.clicks=(window.clicks||0)+1;document.querySelector('#result').textContent='Clicked '+window.clicks+' time(s)'">Count click</button>
+      <button onclick="window.waitClicks=(window.waitClicks||0)+1;document.querySelector('#result').textContent='Wait clicked '+window.waitClicks+' time(s)'">Count wait</button>
       <button onclick="const box=document.querySelector('iframe').getBoundingClientRect();Object.assign(document.querySelector('#cover').style,{display:'block',left:box.left+'px',top:box.top+'px',width:box.width+'px',height:box.height+'px'})">Cover frame</button>
       <button onclick="document.querySelector('#cover').style.display='none'">Uncover frame</button>
       <div id="cover" style="display:none;position:fixed;z-index:99;background:white" onclick="document.querySelector('#result').textContent='Unexpected overlay click'"></div>
@@ -364,6 +408,92 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     assert.equal(switched.output, '1\n');
     snapshot = switched.snapshot;
     assert.equal(snapshot.elements.find(item => item.name === 'Name').value, 'From persistent exec appended', 'Exec tab switches must preserve unrelated tab contents');
+    const automatic = await invoke('browser_exec', { code: [
+      'var autoPage = await page_info();',
+      'var lastAuto = await fill(named(autoPage, "Name"), "One authoritative observation");',
+      'lastAuto;',
+    ].join('\n') });
+    assert.equal(automatic.result.snapshot.refs_current, true);
+    assert.equal(automatic.result.snapshot.snapshot_id, automatic.snapshot.snapshot_id);
+    assert.equal(automatic.result.snapshot.elements, undefined, 'Exec must not serialize duplicate element lists');
+    assert.equal(automatic.stats.snapshots, 2, 'The footer must reuse the verified action snapshot');
+    const reused = await invoke('browser_exec', { code: 'await click(named(lastAuto.snapshot, "Save"), {wait_for:{text:"Saved One authoritative observation"}});' });
+    assert(reused.snapshot.frames[0].text.includes('Saved One authoritative observation'), 'Action result refs must remain valid after the exec footer');
+    const observerPage = frameObserver.contexts()[0].pages().find(page => page.url() === base + '/other');
+    await observerPage.evaluate(() => { document.querySelector('#name').value = 'Changed without a DOM mutation'; });
+    const propertyChange = await invoke('browser_exec', { code: 'rememberedAnswer;' });
+    assert.equal(propertyChange.snapshot.elements.find(item => item.name === 'Name').value, 'Changed without a DOM mutation');
+    assert.equal(propertyChange.stats.reused_snapshot, false);
+    const { data: manual, response: manualResponse } = await session.call('browser_exec', { observation: 'manual', code: [
+      'var manualPage = await page_info();',
+      'await batch([{action:"fill",ref:named(manualPage,"Name"),text:"Manual batch"},{action:"click",ref:named(manualPage,"Save")}],{wait_for:{text:"Saved Manual batch"},include_screenshot:true});',
+    ].join('\n') });
+    assert.equal(manual.stats.snapshots, 2);
+    assert(manualResponse.content.some(item => item.type === 'image'), 'Deferred DOM observations must still honor requested visual context');
+    assert.equal(manual.result.snapshot, undefined);
+    assert.equal(manual.result.completed, true);
+    assert(manual.snapshot.frames[0].text.includes('Saved Manual batch'));
+    const manualStale = await session.call('browser_exec', { observation: 'manual', code: 'var staleManual=await page_info(); await fill(named(staleManual,"Name"),"No replay"); await click(named(staleManual,"Save"));' });
+    assert.equal(manualStale.data.error.code, 'STALE_REF', 'Manual observation must preserve ref invalidation');
+    const conditional = await invoke('browser_exec', { observation: 'manual', code: [
+      'await js("var gate=document.createElement(\'button\'); gate.id=\'gate\'; gate.hidden=true; gate.disabled=true; document.body.append(gate); setTimeout(()=>{gate.hidden=false;gate.disabled=false},250)");',
+      'var gateReady=await wait_for_element("#gate",{state:"enabled"});',
+      'if(!gateReady.wait.matched) throw new Error("Gate did not become enabled");',
+      'var frameCheckpoint=await page_info(); var waitFrame=frameCheckpoint.elements.find(e=>e.name==="Frame input").frame_id;',
+      'await js("document.querySelector(\'input\').disabled=true;setTimeout(()=>document.querySelector(\'input\').disabled=false,250)",{frame_id:waitFrame});',
+      'var frameReady=await wait_for_element("input",{state:"enabled",frame_id:waitFrame});',
+      'var iframeText=await wait_for({text:"Frame input",frame_id:waitFrame});',
+      'await js("document.querySelector(\'#gate\').hidden=true");',
+      'var hiddenReady=await wait_for_element("#gate",{state:"hidden"});',
+      'var attachedReady=await wait_for_element("#gate",{state:"attached"});',
+      'var summary=await page_info({detail:"summary"});',
+      '({frameReady:frameReady.wait.matched,iframeText:iframeText.wait.matched,hidden:hiddenReady.wait.matched,attached:attachedReady.wait.matched,summary});',
+    ].join('\n') });
+    assert.equal(conditional.result.frameReady, true);
+    assert.equal(conditional.result.iframeText, true);
+    assert.equal(conditional.result.hidden, true);
+    assert.equal(conditional.result.attached, true);
+    assert.equal(conditional.result.summary.elements, undefined);
+    assert(conditional.result.summary.viewport.width > 0);
+    const conditionTimeout = await invoke('browser_exec', { observation: 'manual', code: [
+      'var oncePage=await page_info();',
+      'await click(named(oncePage,"Count wait"),{wait_for:{selector:"#never-created",timeout_ms:150}});',
+    ].join('\n') });
+    assert.equal(conditionTimeout.result.wait.matched, false);
+    assert(conditionTimeout.snapshot.frames[0].text.includes('Wait clicked 1 time(s)'), 'Wait timeout must not replay input');
+    const events = await invoke('browser_exec', { observation: 'manual', code: [
+      'await watch_events(); await drain_events();',
+      'await js("fetch(\'/data\').then(r=>r.json()).then(()=>document.querySelector(\'#result\').textContent=\'Network complete\');console.log(\'Event fixture\')");',
+      'var idleResult=await wait_for_network_idle({idle_ms:200,timeout_ms:3000});',
+      'var eventResult=await drain_events();',
+      '({idle:idleResult,stream:eventResult});',
+    ].join('\n') });
+    assert.equal(events.result.idle.matched, true);
+    assert(events.result.stream.events.some(event => event.type === 'response' && event.url === base + '/data' && event.status === 200));
+    assert(events.result.stream.events.some(event => event.type === 'console' && event.text === 'Event fixture'));
+    assert(events.snapshot.frames[0].text.includes('Network complete'), 'Network idle must wait for the real delayed response');
+    const overflow = await invoke('browser_exec', { observation: 'manual', code: 'await js("for(var i=0;i<300;i++)console.log(\'Bounded event\',i)"); var boundedEvents=await drain_events({types:["console"],max_events:256}); ({dropped:boundedEvents.dropped,count:boundedEvents.events.length});' });
+    assert(overflow.result.dropped > 0);
+    assert(overflow.result.count <= 256);
+    const metrics = await observerPage.context().newCDPSession(observerPage);
+    let resized;
+    try {
+      await metrics.send('Emulation.setDeviceMetricsOverride', { width: 800, height: 600, deviceScaleFactor: 2, mobile: false });
+      resized = await session.call('browser_screenshot', { full: true, max_dim: 480 });
+    } finally {
+      await metrics.send('Emulation.clearDeviceMetricsOverride'); await metrics.detach();
+    }
+    const jpeg = Buffer.from(resized.response.content.find(item => item.type === 'image').data, 'base64');
+    let dimensions;
+    for (let offset = 2; offset < jpeg.length;) {
+      const marker = jpeg[offset + 1];
+      const length = jpeg.readUInt16BE(offset + 2);
+      if ([0xc0, 0xc1, 0xc2].includes(marker)) { dimensions = { height: jpeg.readUInt16BE(offset + 5), width: jpeg.readUInt16BE(offset + 7) }; break; }
+      offset += length + 2;
+    }
+    assert(dimensions, 'The screenshot must contain a decodable JPEG frame');
+    assert(Math.max(dimensions.width, dimensions.height) <= 480);
+    assert(resized.data.clip.height > conditional.result.summary.viewport.height, 'Full screenshots must include content below the viewport');
     const frameExecution = await invoke('browser_exec', { code: [
       'var framePage = await page_info();',
       'var childId = framePage.elements.find(item => item.name === "Frame input").frame_id;',

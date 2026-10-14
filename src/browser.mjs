@@ -3,8 +3,9 @@ import { readFile, stat } from 'node:fs/promises';
 import { basename, extname, isAbsolute } from 'node:path';
 import { canForward, forwardChrome } from './adb.mjs';
 import { connectTransport } from './cdp-transport.mjs';
-import { collectDOM, scrollDOM } from './dom.mjs';
+import { collectDOM, observationStamp, scrollDOM } from './dom.mjs';
 import { ControlError, describeError, withDeadline } from './errors.mjs';
+import { PageEvents } from './events.mjs';
 
 // Handle release is housekeeping, never a prerequisite for the next request.
 const release = handle => { handle?.dispose().catch(() => {}); };
@@ -35,6 +36,10 @@ export class BrowserController {
     this.targets = new Map();
     this.titles = new Map();
     this.outcome = {};
+    this.lastSnapshot = null;
+    this.snapshotFrames = [];
+    this.snapshotCount = 0;
+    this.eventStreams = new Map();
   }
 
   assertActive() {
@@ -60,6 +65,8 @@ export class BrowserController {
     this.titles.clear();
     this.cdp = null;
     this.selected = null;
+    for (const stream of this.eventStreams.values()) stream.close();
+    this.eventStreams.clear();
     for (const session of this.execSessions.values()) session.detach().catch(() => {});
     this.execSessions.clear();
     const open = async timeout => {
@@ -122,6 +129,8 @@ export class BrowserController {
   }
 
   async clearRefs() {
+    this.lastSnapshot = null;
+    this.snapshotFrames = [];
     this.refs.clear();
     const handles = this.handles.splice(0);
     handles.forEach(release);
@@ -141,6 +150,8 @@ export class BrowserController {
     this.targets.clear();
     this.titles.clear();
     this.selected = null;
+    for (const stream of this.eventStreams.values()) stream.close();
+    this.eventStreams.clear();
     for (const session of this.execSessions.values()) session.detach().catch(() => {});
     this.execSessions.clear();
     await withDeadline(() => browser?.close(), 1000).catch(() => {});
@@ -152,7 +163,10 @@ export class BrowserController {
     const id = `tab_${this.prefix}_${++this.sequence}`;
     this.pages.set(id, page);
     page.on('dialog', dialog => this.dialogs.set(page, dialog));
-    page.on('close', () => { this.dialogs.delete(page); this.fileChoosers.delete(page); });
+    page.on('close', () => {
+      this.dialogs.delete(page); this.fileChoosers.delete(page);
+      this.eventStreams.get(page)?.close(); this.eventStreams.delete(page);
+    });
     page.on('framedetached', frame => {
       this.execSessions.get(frame)?.detach().catch(() => {});
       this.execSessions.delete(frame);
@@ -302,9 +316,10 @@ export class BrowserController {
 
   async snapshot({ tab_id, max_elements = 160, max_text = 12000 } = {}) {
     const { page, id } = await this.page(tab_id);
+    this.snapshotCount++;
     if (this.dialogs.has(page)) {
       await this.clearRefs();
-      return { tab_id: id, url: page.url(), dialog: this.dialogInfo(page), frames: [], elements: [], recovery: 'Call browser_handle_dialog to accept or dismiss this dialog before interacting with the page.' };
+      return this.lastSnapshot = { tab_id: id, url: page.url(), dialog: this.dialogInfo(page), frames: [], elements: [], recovery: 'Call browser_handle_dialog to accept or dismiss this dialog before interacting with the page.' };
     }
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.clearRefs();
@@ -331,6 +346,7 @@ export class BrowserController {
             Math.max(1, Math.min(remaining, frame === page.mainFrame() ? this.config.actionTimeout : 1500)));
           this.assertActive();
           this.handles.push(handle, nodes);
+          this.snapshotFrames.push({ frame, nodes, stamp: data.stamp });
           if (frame === page.mainFrame()) { title = data.title; this.titles.set(page, title); }
           for (const item of data.elements) {
             const ref = `${snapshotId}:e${elements.length + 1}`;
@@ -359,12 +375,48 @@ export class BrowserController {
         continue;
       }
       if (pageFrames.length > 25) warnings.push({ message: 'Only the first 25 frames were inspected.' });
-      return {
+      return this.lastSnapshot = {
         tab_id: id, snapshot_id: snapshotId, url: page.url(), title,
         frames, elements, ...(warnings.length ? { warnings } : {}),
         reference_help: 'Use ref values from this snapshot. A new snapshot or action invalidates earlier references. Offscreen elements are scrolled into view during interaction.',
       };
     }
+  }
+
+  async currentSnapshot(tabId) {
+    const cached = this.lastSnapshot;
+    if (!cached) return null;
+    const { page, id } = await this.page(tabId);
+    if (cached.tab_id !== id || cached.url !== page.url()) return null;
+    if (cached.dialog) return this.dialogs.has(page) ? cached : null;
+    if (this.dialogs.has(page) || this.snapshotFrames.length !== page.frames().length) return null;
+    try {
+      for (const { frame, nodes, stamp } of this.snapshotFrames) {
+        if (frame.isDetached() || stamp !== await withDeadline(() => nodes.evaluate(observationStamp), 500)) return null;
+      }
+      return cached === this.lastSnapshot ? cached : null;
+    } catch { return null; }
+  }
+
+  async summary(tabId) {
+    const { page, id } = await this.page(tabId);
+    if (this.dialogs.has(page)) return { tab_id: id, url: page.url(), dialog: this.dialogInfo(page) };
+    return { tab_id: id, url: page.url(), ...await page.evaluate(() => ({ title: document.title,
+      viewport: { width: innerWidth, height: innerHeight }, scroll: { x: scrollX, y: scrollY },
+      page: { width: document.scrollingElement?.scrollWidth || innerWidth, height: document.scrollingElement?.scrollHeight || innerHeight } })) };
+  }
+
+  async events(tabId) {
+    const { page, id } = await this.page(tabId);
+    if (!this.eventStreams.has(page)) {
+      const session = await page.context().newCDPSession(page);
+      if (this.stopped) { session.detach().catch(() => {}); this.assertActive(); }
+      const stream = new PageEvents(session);
+      this.eventStreams.set(page, stream);
+      try { await stream.start(); this.assertActive(); }
+      catch (error) { stream.close(); this.eventStreams.delete(page); throw error; }
+    }
+    return { id, stream: this.eventStreams.get(page) };
   }
 
   async target(ref, page) {
@@ -527,7 +579,7 @@ export class BrowserController {
       release(target);
     }
     await this.clearRefs();
-    return this.observe(page, id, { action: name, executed: true }, args.wait_for, name === 'wait');
+    return this.observe(page, id, { action: name, executed: true }, args.wait_for, name === 'wait', args.snapshot !== false);
   }
 
   async perform(page, id, name, args, target, timeout = this.config.actionTimeout) {
@@ -566,12 +618,23 @@ export class BrowserController {
 
   async waitFor(page, condition) {
     const timeout = condition.timeout_ms ?? 5000;
+    const frame = condition.frame_id ? page.frames()[Number(condition.frame_id.replace('frame_', ''))] : page.mainFrame();
+    if (!frame) throw new ControlError('FRAME_UNAVAILABLE', 'The wait frame no longer exists.', 'Inspect page_info() and use a current frame_id.');
     try {
-      const handle = await page.waitForFunction(({ text, text_absent, url }) => {
+      const handle = await frame.waitForFunction(({ text, text_absent, url, selector, state = 'visible' }) => {
         const body = document.body?.innerText || '';
+        let ready = true;
+        if (selector) {
+          const node = document.querySelector(selector);
+          const box = node?.getBoundingClientRect();
+          const visible = !!(node && box.width && box.height &&
+            (node.checkVisibility ? node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : getComputedStyle(node).display !== 'none'));
+          ready = state === 'attached' ? !!node : state === 'hidden' ? !visible :
+            state === 'enabled' ? visible && !node.matches(':disabled') && !node.closest('[aria-disabled="true"],[inert]') : visible;
+        }
         return (text === undefined || body.includes(text)) &&
           (text_absent === undefined || !body.includes(text_absent)) &&
-          (url === undefined || location.href.includes(url));
+          (url === undefined || location.href.includes(url)) && ready;
       }, condition, { polling: 100, timeout });
       release(handle);
       return { matched: true };
@@ -582,16 +645,18 @@ export class BrowserController {
     }
   }
 
-  async observe(page, id, output, condition, alreadyWaited = false) {
+  async observe(page, id, output, condition, alreadyWaited = false, includeSnapshot = true) {
+    output.tab_id = id;
     if (!this.dialogs.has(page) && !this.fileChoosers.has(page)) {
       if (condition) {
         try { output.wait = await this.waitFor(page, condition); }
         catch (error) { output.wait_error = describeError(error); }
-      } else if (!alreadyWaited) await page.waitForTimeout(150);
+      } else if (!alreadyWaited && includeSnapshot) await page.waitForTimeout(150);
     }
     this.assertActive();
     const chooser = this.fileChoosers.get(page);
     if (chooser) output.file_chooser = { multiple: chooser.isMultiple(), recovery: 'Call browser_upload with local file paths. The native file picker was intercepted.' };
+    if (!includeSnapshot) return { ...output, refs_invalidated: !this.lastSnapshot };
     try {
       return { ...output, snapshot: await this.snapshot({ tab_id: id }) };
     } catch (error) {
@@ -599,7 +664,7 @@ export class BrowserController {
     }
   }
 
-  async batch({ tab_id, actions, wait_for }) {
+  async batch({ tab_id, actions, wait_for, snapshot }) {
     const { page, id } = await this.page(tab_id);
     if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is blocking this tab.', 'Call browser_handle_dialog.');
     const targets = [];
@@ -649,10 +714,10 @@ export class BrowserController {
       targets.forEach(({ node }) => release(node));
     }
     await this.clearRefs();
-    return this.observe(page, id, { action: 'batch', executed: results.length > 0, completed: results.length === actions.length, results, ...(stop ? { stopped: stop } : {}) }, wait_for);
+    return this.observe(page, id, { action: 'batch', executed: results.length > 0, completed: results.length === actions.length, results, ...(stop ? { stopped: stop } : {}) }, wait_for, false, snapshot !== false);
   }
 
-  async upload({ tab_id, ref, paths, wait_for }) {
+  async upload({ tab_id, ref, paths, wait_for, snapshot }) {
     const { page, id } = await this.page(tab_id);
     if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is blocking this tab.', 'Call browser_handle_dialog.');
     const chooser = !ref && this.fileChoosers.get(page);
@@ -686,15 +751,16 @@ export class BrowserController {
       this.fileChoosers.delete(page);
       if (chooser) release(target);
       await this.clearRefs();
-      return this.observe(page, id, { action: 'upload', executed: true, files: files.map(file => ({ name: file.name, size: file.buffer.length })) }, wait_for);
+      return this.observe(page, id, { action: 'upload', executed: true, files: files.map(file => ({ name: file.name, size: file.buffer.length })) }, wait_for, false, snapshot !== false);
     } finally { if (ref) release(target); }
   }
 
-  async screenshot({ tab_id, ref } = {}) {
+  async screenshot({ tab_id, ref, full = false, max_dim } = {}) {
     const { page, id } = await this.page(tab_id);
     if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is open in this tab.', 'Read browser_snapshot, then call browser_handle_dialog.', { dialog: this.dialogInfo(page) });
     let target;
     try {
+      if (ref && full) throw new ControlError('SCREENSHOT_SCOPE_INVALID', 'Choose an element crop or a full page screenshot.', 'Use ref for a crop, or full: true without ref.');
       let clip;
       if (ref) {
         target = await this.target(ref, page);
@@ -707,12 +773,29 @@ export class BrowserController {
         }
         if (!clip || clip.width <= 0 || clip.height <= 0) throw new ControlError('ELEMENT_NOT_VISIBLE', 'The screenshot target has no visible viewport area.', 'Scroll its parent into view and inspect a fresh snapshot.');
       }
+      if (full || max_dim) {
+        let session;
+        try {
+          session = await page.context().newCDPSession(page);
+          const { cssContentSize: content, contentSize, cssVisualViewport: viewport } = await session.send('Page.getLayoutMetrics');
+          const capture = clip ? { ...clip, x: clip.x + viewport.pageX, y: clip.y + viewport.pageY } :
+            full ? { x: content.x, y: content.y, width: content.width, height: content.height } :
+              { x: viewport.pageX, y: viewport.pageY, width: viewport.clientWidth, height: viewport.clientHeight };
+          const scale = Math.min(1, (max_dim || 16384) / Math.max(capture.width, capture.height));
+          const deviceScale = contentSize.width / content.width || 1;
+          const { data } = await withDeadline(() => session.send('Page.captureScreenshot', {
+            format: 'jpeg', quality: 70, captureBeyondViewport: full, clip: { ...capture, scale: scale / deviceScale },
+          }), this.config.actionTimeout);
+          this.assertActive();
+          return { tab_id: id, url: page.url(), clip: capture, scale, full, data };
+        } finally { session?.detach().catch(() => {}); }
+      }
       const data = await page.screenshot({ type: 'jpeg', quality: 70, scale: 'css', fullPage: false, ...(clip ? { clip } : {}), timeout: this.config.actionTimeout });
       return { tab_id: id, url: page.url(), ...(clip ? { clip } : {}), data: data.toString('base64') };
     } finally { release(target); }
   }
 
-  async evaluate({ expression, tab_id, frame_id }) {
+  async evaluate({ expression, tab_id, frame_id, snapshot }) {
     const { page, id } = await this.page(tab_id);
     const frame = frame_id ? page.frames()[Number(frame_id.replace('frame_', ''))] : page.mainFrame();
     if (!frame) throw new ControlError('FRAME_UNAVAILABLE', 'This frame is no longer available.', 'Inspect a fresh snapshot and choose a current frame_id.');
@@ -724,6 +807,7 @@ export class BrowserController {
     this.outcome.executed = true;
     const serialized = JSON.stringify(result ?? null);
     const output = { tab_id: id, executed: true, ...(serialized.length > 20000 ? { result_text: serialized.slice(0, 20000), truncated: true } : { result: result ?? null }) };
+    if (snapshot === false) return { ...output, refs_invalidated: true };
     try { return { ...output, snapshot: await this.snapshot({ tab_id: id }) }; }
     catch (error) { return { ...output, observation_error: describeError(error), recovery: 'Evaluation executed, but its snapshot failed. Inspect the page before repeating it.' }; }
   }

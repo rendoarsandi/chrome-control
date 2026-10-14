@@ -22,6 +22,27 @@ export function collectDOM({ maxElements, maxText }) {
       }
     }
   }
+  const key = Symbol.for('chrome-control.observation');
+  const tracker = globalThis[key] ||= { revision: 0 };
+  tracker.observer ||= new MutationObserver(() => { tracker.revision++; });
+  if (tracker.observer.takeRecords().length) tracker.revision++;
+  tracker.observer.disconnect();
+  for (const root of roots) tracker.observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+  tracker.stamp = retained => {
+    if (tracker.observer.takeRecords().length) tracker.revision++;
+    const properties = retained.map(node => {
+      const box = node.getBoundingClientRect();
+      return [node.isConnected, node.type === 'password' ? null : node.value,
+        node.checked, node.disabled, node.scrollLeft, node.scrollTop, node.scrollHeight, node.scrollWidth,
+        box.x, box.y, box.width, box.height, node.complete, node.naturalWidth,
+        node.type === 'file' ? Array.from(node.files || []).map(file => [file.name, file.size]) : null];
+    });
+    const text = JSON.stringify([tracker.revision, location.href, document.title, innerWidth, innerHeight, scrollX, scrollY,
+      document.body?.innerText, ...roots.slice(1).map(root => Array.from(root.children).map(child => child.innerText || '').join('\n')), properties]);
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index++) hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+    return String(hash >>> 0);
+  };
   const visible = element => {
     const box = element.getBoundingClientRect();
     if (!box.width || !box.height) return false;
@@ -77,7 +98,13 @@ export function collectDOM({ maxElements, maxText }) {
     nodes.push(element);
   }
   const text = [document.body?.innerText || '', ...shadowText].join('\n').trim();
-  return { nodes, data: { title: document.title, text: text.slice(0, maxText), text_truncated: text.length > maxText, elements, elements_truncated: total > elements.length } };
+  return { nodes, data: { stamp: tracker.stamp(nodes), title: document.title, text: text.slice(0, maxText), text_truncated: text.length > maxText, elements, elements_truncated: total > elements.length } };
+}
+
+// A small fingerprint verifies cached observations without rediscovering the
+// DOM. Property changes (which MutationObserver misses) and layout are included.
+export function observationStamp(nodes) {
+  return globalThis[Symbol.for('chrome-control.observation')]?.stamp(nodes) ?? null;
 }
 
 // Choose the visible scroll container under the viewport center before falling

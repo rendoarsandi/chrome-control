@@ -21,6 +21,8 @@ Configuration:
   CHROME_DEVTOOLS_SOCKET    Default: chrome_devtools_remote
   CHROME_ACTION_TIMEOUT_MS  Default: 8000
   CHROME_REQUEST_TIMEOUT_MS Default: 30000
+  CHROME_TOOL_MODE          full (default) or compact for three MCP tools
+  CHROME_HELPER_FILES       JSON array of absolute JS helper file paths
 
 See README.md for Termux setup and Codex/Claude Code/client configuration.`);
 } else if (args.some(arg => arg !== '--stdio')) {

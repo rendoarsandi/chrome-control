@@ -14,12 +14,19 @@ export function readConfig(env = process.env) {
   if (env.CHROME_AUTO_ADB && !['0', '1'].includes(env.CHROME_AUTO_ADB)) {
     throw new Error('CHROME_AUTO_ADB must be 0 or 1.');
   }
+  const toolMode = env.CHROME_TOOL_MODE || 'full';
+  if (!['full', 'compact'].includes(toolMode)) throw new Error('CHROME_TOOL_MODE must be full or compact.');
+  const helperFiles = JSON.parse(env.CHROME_HELPER_FILES || '[]');
+  if (!Array.isArray(helperFiles) || helperFiles.length > 5 || helperFiles.some(path => typeof path !== 'string')) {
+    throw new Error('CHROME_HELPER_FILES must be a JSON array of at most five paths.');
+  }
   return {
     endpoint,
     autoAdb: env.CHROME_AUTO_ADB !== '0',
     serial: env.ANDROID_SERIAL || undefined,
     package: env.CHROME_ANDROID_PACKAGE || 'com.android.chrome',
     socket: env.CHROME_DEVTOOLS_SOCKET || 'chrome_devtools_remote',
+    toolMode, helperFiles,
     actionTimeout: number('CHROME_ACTION_TIMEOUT_MS', 8000, 1000, 30000),
     requestTimeout: number('CHROME_REQUEST_TIMEOUT_MS', 30000, 10000, 60000),
   };

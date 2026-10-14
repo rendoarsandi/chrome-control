@@ -136,7 +136,7 @@ browser_batch({
 
 The server retains the actual nodes before starting, checks them before each action, and returns one final snapshot. It stops on navigation, a popup, a dialog, a file chooser, a changed or detached target, a failure, or its time budget. Inspect `completed`, `results`, and `stopped`; completed actions are not rolled back or repeated. Batch only steps whose targets and purpose are already known. After a page change, inspect the returned snapshot before planning another batch.
 
-All ordinary actions also accept `wait_for` with literal `text`, `text_absent`, or `url` substring conditions. All supplied conditions must match; matching inspects the main frame. The timeout is at most five seconds. A timeout returns `wait.matched: false` alongside the executed action and its snapshot, so callers do not need to guess whether a submission ran. `include_screenshot` adds a viewport image to the same tool result. Neither option claims that the user's task is complete.
+All ordinary actions also accept `wait_for` with literal `text`, `text_absent`, `url` substring conditions, or a CSS `selector` with `state: "attached"`, `"visible"`, `"hidden"` or `"enabled"`. All supplied conditions must match. Set a current `frame_id` to observe an iframe; otherwise matching inspects the main frame. Selectors only observe readiness; input still uses exact refs. The timeout is at most five seconds. A timeout returns `wait.matched: false` alongside the executed action and its snapshot. `include_screenshot` adds a viewport image to the same tool result.
 
 For file uploads, use a `file_input` ref from the latest snapshot, including a hidden input in an iframe:
 
@@ -167,7 +167,7 @@ References retain actual DOM nodes. A layout change cannot silently turn an old 
 | `browser_scroll` | Scroll the viewport or a referenced container |
 | `browser_navigate`, `browser_back` | Navigate a selected tab |
 | `browser_wait` | Wait up to five seconds and observe again |
-| `browser_screenshot` | Return a viewport JPEG, or crop a referenced element |
+| `browser_screenshot` | Viewport, full page or element JPEG; optional longest-edge limit |
 | `browser_tap` | Click viewport CSS pixel coordinates for canvas or visual controls |
 | `browser_evaluate` | JavaScript fallback with a result and fresh snapshot |
 
@@ -189,7 +189,29 @@ browser_exec({
 })
 ```
 
-The response includes captured output, the last expression, completed helper steps and a final snapshot. Use `include_snapshot: false` when code already returns the needed observation. Output is limited to 20,000 characters and each call to 100 browser helpers. Execution runs in a worker with a bounded timeout; CPU loops cannot block MCP stdout or request handling. A timeout resets the namespace and connection, preserves tabs and reports completed steps without replaying input. An ordinary script error preserves variables. `cdp(method, params, {frame_id})` accesses the selected page or a current snapshot frame; tab management uses the explicit tab helpers. Code is authored by the assistant; page text is untrusted data.
+The response includes captured output, the last expression, completed helper steps and one authoritative final snapshot. If the last observation still matches the page, it is reused and its refs stay valid. Snapshots nested in the serialized result become small references with `refs_current`; scripts retain their full helper results internally. `stats` reports actual snapshot counts and elapsed time. Use `include_snapshot: false` to return observations from your code directly. Output is limited to 20,000 characters and each call to 100 browser helpers. Execution runs in a worker with a bounded timeout; CPU loops cannot block MCP stdout or request handling. A timeout resets the namespace and connection, preserves tabs and reports completed steps without replaying input. An ordinary script error preserves variables. `cdp(method, params, {frame_id})` accesses the selected page or a current snapshot frame; tab management uses the explicit tab helpers. Code is authored by the assistant; page text is untrusted data.
+
+For fewer DOM reads, use `observation: "manual"`. Action helpers then defer snapshots to explicit `page_info()` checkpoints and the final observation. Input still invalidates refs: put a known sequence in `batch()`, and call `page_info()` before planning further ref actions. An individual helper can override this with `{snapshot: true}`. `page_info({detail: "summary"})` reads just the URL, title, viewport, scroll and page dimensions without issuing new refs.
+
+```js
+browser_exec({
+  observation: "manual",
+  code: `var p = await page_info();
+    var name = p.elements.find(e => e.name === "Name").ref;
+    var save = p.elements.find(e => e.name === "Save").ref;
+    var submitted = await batch([
+      {action: "fill", ref: name, text: "Termux"},
+      {action: "click", ref: save}
+    ], {wait_for: {text: "Saved Termux"}});
+    if (!submitted.completed) print(submitted.stopped);`
+})
+```
+
+`wait_for_element(selector, {state, frame_id, timeout_ms})` waits for controls without repeated snapshots. `watch_events()` starts a selected-page event stream; call it before input. `drain_events({types, max_events})` consumes bounded network, console, exception and navigation events, with a dropped count when the buffer overflows. `wait_for_network_idle({idle_ms, timeout_ms})` watches requests after attachment and returns `matched: false` on timeout. WebSocket and EventSource streams are excluded from pending requests. Events omit response bodies and headers.
+
+Save reusable assistant-authored JavaScript functions in local files and pass `helper_files: ["/absolute/path/helpers.js"]`, or configure `CHROME_HELPER_FILES`. Files load before execution, reload when changed, and rebuild after a namespace reset. Use functions or `var` for declarations that need reloading; redeclaring `const` or `let` follows normal JavaScript rules. Limits are five regular files, 64 KiB each and 128 KiB total. Never load code obtained from a browser page.
+
+Set `CHROME_TOOL_MODE=compact` to expose only `browser_status`, `browser_exec` and `browser_screenshot`. All ordinary tools remain callable as helpers inside exec. Start with status, then use `select_tab(id)` and `page_info()` inside exec. The default `full` mode preserves individual tools for existing clients. Both modes use the connected assistant for reasoning.
 
 ### Recover without restarting Codex
 
@@ -216,6 +238,8 @@ JavaScript dialogs remain open for the assistant to inspect and explicitly accep
 | `CHROME_DEVTOOLS_SOCKET` | `chrome_devtools_remote` | Android Chrome debugging socket |
 | `CHROME_ACTION_TIMEOUT_MS` | `8000` | Per-action timeout, 1000–30000 ms |
 | `CHROME_REQUEST_TIMEOUT_MS` | `30000` | Tool execution deadline, 10000–60000 ms |
+| `CHROME_TOOL_MODE` | `full` | `compact` exposes three tools while keeping all exec helpers |
+| `CHROME_HELPER_FILES` | `[]` | JSON array of absolute paths to assistant-authored JS helper files |
 
 ## Troubleshooting and limits
 
@@ -230,7 +254,7 @@ JavaScript dialogs remain open for the assistant to inspect and explicitly accep
 - **File picker requires manual input:** use a hidden `file_input` ref with `browser_upload`, or open Browse files using `browser_click` so the MCP can intercept the chooser. Picker dialogs already opened manually cannot be intercepted retroactively.
 - **Termux pauses when Chrome opens:** Android may suspend or kill background apps. Samsung battery settings and `termux-wake-lock` can help keep Termux active; memory usage and survival depend on the device and OS settings.
 
-Screenshots are viewport-sized JPEGs. DOM outputs are bounded to limit memory and context usage. This is a Node.js client controlling the already running browser, so it avoids installing another browser on the phone. It does not guarantee a fixed memory footprint or immunity to Android process termination.
+Screenshots are viewport JPEGs by default. `browser_screenshot({full: true, max_dim: 1280})` captures the page with its longest edge bounded; `ref` instead selects an element crop. DOM and event outputs are bounded to limit memory and context usage. This Node.js client controls the already running browser and avoids installing another browser on the phone. It does not guarantee a fixed memory footprint or immunity to Android process termination.
 
 ## Development and migration
 

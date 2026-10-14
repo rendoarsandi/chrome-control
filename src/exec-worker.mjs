@@ -8,6 +8,7 @@ let active;
 let sequence = 0;
 const pending = new Map();
 const timers = new Set();
+const loadedHelpers = new Map();
 const errorData = error => ({
   code: error?.code || 'EXEC_ERROR',
   message: String(error?.message || error).slice(0, 4000),
@@ -39,7 +40,7 @@ const print = (...values) => {
 for (const name of new Set([...builtinModules.map(name => name.replace(/^node:/, '').split('/')[0]),
   'process', 'require', 'module', 'Buffer', 'fetch', 'global',
   'setTimeout', 'setInterval', 'setImmediate', 'clearTimeout', 'clearInterval', 'clearImmediate'])) {
-  if (name !== 'console' && /^[A-Za-z_$][\w$]*$/.test(name)) Object.defineProperty(session.context, name, { value: undefined, configurable: false });
+  if (name !== 'console' && /^[A-Za-z_$][\w$]*$/.test(name)) Object.defineProperty(session.context, name, { value: undefined, writable: true, configurable: true });
 }
 Object.defineProperties(session.context, {
   print: { value: print },
@@ -49,6 +50,7 @@ Object.defineProperties(session.context, {
       throw new Error('sleep requires an integer from zero to 5000 milliseconds.');
     }
     return new Promise(resolve => {
+      parentPort.postMessage({ type: 'observation_invalidated', id: active.id });
       const timer = setTimeout(() => { timers.delete(timer); resolve(); }, milliseconds);
       timers.add(timer);
     });
@@ -75,7 +77,9 @@ for (const name of workerData.helpers) Object.defineProperty(session.context, na
 const serialize = value => {
   if (value === undefined) return {};
   try {
-    const text = JSON.stringify(value);
+    const text = JSON.stringify(value, (_key, item) => active?.summarizeSnapshots && item?.snapshot_id &&
+      Array.isArray(item.frames) && Array.isArray(item.elements)
+      ? { snapshot_reference: item.snapshot_id, tab_id: item.tab_id } : item);
     if (text === undefined) return { result_text: String(value).slice(0, 20000) };
     return text.length > 20000
       ? { result_text: text.slice(0, 20000), result_truncated: true }
@@ -94,13 +98,19 @@ parentPort.on('message', async message => {
     return;
   }
   if (message.type !== 'execute' || active) return;
-  const execution = { id: message.id, outputLength: 0, truncated: false };
+  const execution = { id: message.id, outputLength: 0, truncated: false, summarizeSnapshots: message.summarizeSnapshots };
   active = execution;
   try {
-    const value = await new Promise((resolve, reject) => {
+    const evaluate = (code, filename) => new Promise((resolve, reject) => {
       execution.fail = reject;
-      session.eval(message.code + '\n', session.context, 'browser_exec', (error, result) => error ? reject(error) : resolve(result));
+      session.eval(code + '\n', session.context, filename, (error, result) => error ? reject(error) : resolve(result));
     });
+    for (const source of message.helperSources) {
+      if (loadedHelpers.get(source.path) === source.hash) continue;
+      await evaluate(source.code, source.path);
+      loadedHelpers.set(source.path, source.hash);
+    }
+    const value = await evaluate(message.code, 'browser_exec');
     // Finish browser requests started by code even if it forgot an await.
     while ([...pending.values()].some(request => request.execution === execution.id)) {
       await Promise.all([...pending.values()].filter(request => request.execution === execution.id).map(request => request.promise));

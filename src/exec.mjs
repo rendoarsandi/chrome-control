@@ -35,6 +35,7 @@ export class BrowserExecutor {
       if (this.worker !== worker || !active || message.id !== active.id) return;
       if (message.type === 'output') this.appendOutput(message.text);
       if (message.type === 'truncated') this.progress.output_truncated = true;
+      if (message.type === 'observation_invalidated') active.options.onObservationInvalidation?.();
       if (message.type === 'helper') {
         active.pendingHelpers++;
         // Serialize helpers as well as whole MCP requests. Late work after a
@@ -88,18 +89,19 @@ export class BrowserExecutor {
       'The execution namespace was reset. Inspect the page and completed steps before trying again.'));
   }
 
-  run(code, invoke, timeout) {
+  run(code, invoke, timeout, options = {}) {
     this.progress = { action: 'exec', output: '', steps: [] };
     this.start();
     return new Promise((resolve, reject) => {
-      const active = { id: ++this.sequence, invoke, resolve, reject, queue: Promise.resolve(), pendingHelpers: 0 };
+      const active = { id: ++this.sequence, invoke, resolve, reject, options, queue: Promise.resolve(), pendingHelpers: 0 };
       this.active = active;
       active.timer = setTimeout(() => {
         this.progress.session_reset = true;
         this.reset(new ControlError('EXEC_TIMEOUT', 'Browser execution exceeded ' + timeout + ' ms.',
           'The execution namespace and browser connection were reset. Inspect the page and completed steps; input is never replayed.'));
       }, timeout);
-      this.worker.postMessage({ type: 'execute', id: active.id, code });
+      this.worker.postMessage({ type: 'execute', id: active.id, code,
+        summarizeSnapshots: options.summarizeSnapshots, helperSources: options.helperSources || [] });
     });
   }
 
