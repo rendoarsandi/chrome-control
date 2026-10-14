@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,7 +23,10 @@ async function clientFor(env) {
   await client.connect(transport);
   return { client, stderr: () => stderr, call: async (name, args = {}) => {
     const response = await client.callTool({ name, arguments: args });
-    const data = JSON.parse(response.content.find(item => item.type === 'text').text);
+    const raw = response.content.find(item => item.type === 'text').text;
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (error) { throw new Error('Tool returned non-JSON: ' + raw, { cause: error }); }
     return { response, data };
   } };
 }
@@ -146,13 +149,33 @@ test('MCP discovers tools without Chrome or API keys and gives actionable connec
   const session = await clientFor({ CHROME_CDP_URL: 'http://127.0.0.1:1', CHROME_AUTO_ADB: '0', GEMINI_API_KEY: '', OPENAI_API_KEY: '', ANTHROPIC_API_KEY: '' });
   try {
     const { tools } = await session.client.listTools();
-    assert.equal(tools.length, 18);
     assert(tools.some(tool => tool.name === 'browser_snapshot'));
     assert(tools.some(tool => tool.name === 'browser_click' && tool.inputSchema.required.includes('ref')));
     const { response, data } = await session.call('browser_status');
     assert.equal(response.isError, true);
     assert.equal(data.error.code, 'CDP_UNAVAILABLE');
     assert.match(data.error.recovery, /CHROME_CDP_URL/);
+    const execute = (code, options = {}) => session.call('browser_exec', { code, include_snapshot: false, ...options });
+    const first = await execute('const saved = await Promise.resolve(41); function next(value) { return value + 1; } print(saved);');
+    assert.equal(first.data.ok, true, JSON.stringify(first.data));
+    assert.equal(first.data.output, '41\n');
+    const second = await execute('console.log(next(saved)); next(saved)');
+    assert.equal(second.data.result, 42, 'Variables and functions must survive across MCP calls');
+    assert.equal(second.data.output, '42\n');
+    const failed = await execute('print("Before failure"); throw new Error("Script failed")');
+    assert.equal(failed.response.isError, true);
+    assert.equal(failed.data.error.code, 'EXEC_ERROR');
+    assert.equal(failed.data.output, 'Before failure\n');
+    assert.equal((await execute('saved')).data.result, 41, 'Ordinary script errors must preserve the namespace');
+    const syntax = await execute('const invalid = ;');
+    assert.equal(syntax.data.error.code, 'EXEC_ERROR');
+    const bounded = await execute('console.log("x".repeat(100000))');
+    assert.equal(bounded.data.output.length, 20000);
+    assert.equal(bounded.data.output_truncated, true);
+    const timeout = await execute('while (true) {}', { timeout_ms: 300 });
+    assert.equal(timeout.data.error.code, 'EXEC_TIMEOUT', 'CPU-bound code must not freeze the MCP request loop');
+    assert.equal(timeout.data.session_reset, true);
+    assert.equal((await execute('typeof saved')).data.result, 'undefined', 'A timed-out namespace must be discarded');
     assert.equal(session.stderr(), '');
   } finally { await session.client.close(); }
 });
@@ -191,6 +214,18 @@ test('ADB passes configuration as arguments, validates timeouts, and bounds requ
     return { stdout: '' };
   }, { reconnect: true });
   assert.deepEqual(repair.slice(0, 2), [['disconnect', '192.168.100.14:41803'], ['connect', '192.168.100.14:41803']]);
+  // Reconnecting a newly supplied port must proceed even if it was never connected.
+  const newPort = [];
+  await forwardChrome(readConfig({ ANDROID_SERIAL: '192.168.100.14:45749' }), async (_, args) => {
+    newPort.push(args);
+    if (args[0] === 'disconnect') throw Object.assign(new Error('disconnect failed'), { stderr: "error: no such device '192.168.100.14:45749'" });
+    return { stdout: '' };
+  }, { reconnect: true });
+  assert(newPort.some(args => args[0] === 'connect'), 'A missing old connection must not prevent connecting the new port');
+  assert(newPort.some(args => args[2] === 'forward'));
+  await assert.rejects(forwardChrome(readConfig({ ANDROID_SERIAL: '192.168.100.14:45749' }), async () => {
+    throw new Error('ADB server permission denied');
+  }, { reconnect: true }), error => error.code === 'ADB_FAILED' && error.message.includes('permission denied'));
   const abort = new AbortController();
   let adbStarted = false;
   abort.abort();
@@ -200,27 +235,49 @@ test('ADB passes configuration as arguments, validates timeouts, and bounds requ
   await assert.rejects(withDeadline(() => new Promise(() => {}), 20), error => error.code === 'REQUEST_TIMEOUT');
 });
 
-test('real browser MCP actions, frames, shadow DOM, tab safety and reference lifetime', { timeout: 90000 }, async t => {
+test('real browser MCP actions, frames, shadow DOM, tab safety and reference lifetime', { timeout: 120000 }, async t => {
   const executable = process.env.CHROME_TEST_EXECUTABLE;
   if (!executable) return t.skip('Set CHROME_TEST_EXECUTABLE to a desktop Chromium binary.');
   const site = createHttpServer((request, response) => {
     response.setHeader('content-type', 'text/html');
-    if (request.url === '/frame') return response.end('<label>Frame input <input aria-label="Frame input"></label>');
+    if (request.url === '/frame') return response.end(`<label>Frame input <input aria-label="Frame input"></label>
+      <input type="file" aria-label="Frame upload" style="display:none" onchange="this.files[0].text().then(text=>parent.postMessage({upload:text},'*'))">
+      <button onclick="document.querySelector('input[type=file]').click()">Browse files</button>
+      <script>window.requestAnimationFrame=()=>0;</script>`);
+    if (request.url === '/scroller') return response.end(`<style>html,body{margin:0;height:100%;overflow:hidden}main{height:100vh;overflow:auto}</style>
+      <main><h1>Scroll container</h1><div style="height:1500px"></div><button>Nested bottom</button></main>`);
     response.end(`<!doctype html><title>Browser fixture</title>
       <h1>Choose a color</h1><label>Name <input id="name"></label>
       <label>Password <input id="password" type="password" value="secret-password"></label>
       <button id="submit" onclick="document.querySelector('#result').textContent='Saved '+document.querySelector('#name').value">Save</button>
       <p id="result">Not saved</p>
+      <p id="uploaded">No upload</p>
+      <a style="cursor:pointer" onclick="document.querySelector('#result').textContent='Deleted'">Delete attachment</a>
+      <button onclick="setTimeout(()=>document.querySelector('#result').textContent='Delayed result',600)">Delayed save</button>
+      <button onclick="document.querySelector('#bottom').textContent='Changed target'">Change planned target</button>
+      <button onclick="document.querySelector('#bottom').remove()">Remove planned target</button>
+      <button onclick="location.href='/other'">Navigate away</button>
+      <button onclick="window.clicks=(window.clicks||0)+1;document.querySelector('#result').textContent='Clicked '+window.clicks+' time(s)'">Count click</button>
+      <button onclick="const box=document.querySelector('iframe').getBoundingClientRect();Object.assign(document.querySelector('#cover').style,{display:'block',left:box.left+'px',top:box.top+'px',width:box.width+'px',height:box.height+'px'})">Cover frame</button>
+      <button onclick="document.querySelector('#cover').style.display='none'">Uncover frame</button>
+      <div id="cover" style="display:none;position:fixed;z-index:99;background:white" onclick="document.querySelector('#result').textContent='Unexpected overlay click'"></div>
       <button onclick="document.querySelector('#result').textContent=confirm('Confirm action?')?'Confirmed':'Cancelled'">Confirm</button>
       <select aria-label="Color"><option value="red">Red</option><option value="blue">Blue</option></select>
       <label><input type="checkbox">Agree</label><button disabled>Disabled</button>
       <button style="display:none">Hidden</button><iframe src="http://localhost:${site.address().port}/frame"></iframe>
       <div id="shadow"></div><div style="height:1600px"></div><button id="bottom">Bottom</button>
-      <script>document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<p>Shadow context</p><button>Shadow button</button>'</script>`);
+      <script>
+        document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<p>Shadow context</p><button>Shadow button</button>';
+        addEventListener('message',event=>{if(event.data.upload)document.querySelector('#uploaded').textContent=event.data.upload});
+        document.querySelector('#bottom').addEventListener('click',()=>document.querySelector('#result').textContent='Unexpected bottom click');
+      </script>`);
   });
   await new Promise(resolve => site.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${site.address().port}`;
   const fixture = await startBrowser(executable);
+  const uploadDir = await mkdtemp(join(tmpdir(), 'chrome-control-upload-'));
+  const uploadPath = join(uploadDir, 'payload.txt');
+  await writeFile(uploadPath, 'Upload received from local MCP host');
   let session;
   let frameObserver;
   try {
@@ -256,6 +313,8 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     assert(snapshot.elements.some(element => element.name === 'Shadow button'));
     assert(!snapshot.elements.some(element => element.name === 'Hidden'));
     assert(snapshot.elements.find(element => element.name === 'Disabled').disabled);
+    assert(snapshot.elements.some(element => element.name === 'Delete attachment'), 'Link-shaped JavaScript controls must have refs');
+    assert.equal(snapshot.elements.find(element => element.name === 'Frame upload').role, 'file_input', 'Hidden cross-origin file inputs must remain addressable');
     assert(!JSON.stringify(snapshot).includes('secret-password'));
     assert.equal(snapshot.elements.find(element => element.name === 'Bottom').in_viewport, false);
     const staleRef = find('Save');
@@ -264,6 +323,128 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     assert.equal(stale.data.error.code, 'STALE_REF');
     snapshot = (await invoke('browser_click', { ref: find('Save') })).snapshot;
     assert(snapshot.frames[0].text.includes('Saved Termux'));
+    const { data: execution, response: executionResponse } = await session.call('browser_exec', {
+      code: [
+        'var rememberedAnswer = "From persistent exec";',
+        'function named(snapshot, name) { const item = snapshot.elements.find(item => item.name === name); if (!item) throw new Error("Missing " + name); return item.ref; }',
+        'await goto_url(' + JSON.stringify(base + '/other') + ');',
+        'await wait_for_load();',
+        'var current = await page_info();',
+        'current = (await fill(named(current, "Name"), rememberedAnswer)).snapshot;',
+        'await type_text(" appended");',
+        'current = await page_info();',
+        'if (!current.elements.find(item => item.name === "Agree").checked) current = (await click(named(current, "Agree"))).snapshot;',
+        'current = (await select(named(current, "Color"), ["blue"])).snapshot;',
+        'await click(named(current, "Save"), {wait_for: {text: "Saved " + rememberedAnswer + " appended"}});',
+        'var protocol = await cdp("Runtime.evaluate", {expression: "document.title", returnByValue: true});',
+        'print(protocol.result.value);',
+        'rememberedAnswer;',
+      ].join('\n'), include_screenshot: true,
+    });
+    assert.equal(executionResponse.isError, undefined, JSON.stringify(execution));
+    assert.equal(execution.result, 'From persistent exec');
+    assert.equal(execution.output, 'Browser fixture\n');
+    assert(executionResponse.content.some(item => item.type === 'image'));
+    snapshot = execution.snapshot;
+    assert(snapshot.frames[0].text.includes('Saved From persistent exec appended'));
+    assert.equal(snapshot.elements.find(item => item.name === 'Agree').checked, true);
+    assert.equal(snapshot.elements.find(item => item.name === 'Color').value, 'blue');
+    const persisted = await invoke('browser_exec', { code: 'rememberedAnswer' });
+    assert.equal(persisted.result, 'From persistent exec');
+    snapshot = persisted.snapshot;
+    const switched = await invoke('browser_exec', { tab_id: tabId, code: [
+      'var temporary = await new_tab(' + JSON.stringify(base + '/?exec-tab') + ');',
+      'var temporaryPage = await page_info();',
+      'if (temporaryPage.tab_id !== temporary.tab_id) throw new Error("Exec ignored the selected tab");',
+      'await fill(named(temporaryPage, "Name"), "Only the temporary tab");',
+      'await close_tab(temporary.tab_id);',
+      'await select_tab(' + JSON.stringify(tabId) + ');',
+      'print((await list_tabs()).length);',
+    ].join('\n') });
+    assert.equal(switched.output, '1\n');
+    snapshot = switched.snapshot;
+    assert.equal(snapshot.elements.find(item => item.name === 'Name').value, 'From persistent exec appended', 'Exec tab switches must preserve unrelated tab contents');
+    const frameExecution = await invoke('browser_exec', { code: [
+      'var framePage = await page_info();',
+      'var childId = framePage.elements.find(item => item.name === "Frame input").frame_id;',
+      'var childResult = await js("document.querySelector(\'input[type=file]\').type", {frame_id: childId});',
+      'childResult.result;',
+    ].join('\n') });
+    assert.equal(frameExecution.result, 'file', 'Exec JS must evaluate in the requested iframe');
+    snapshot = frameExecution.snapshot;
+    const partial = await session.call('browser_exec', { code: [
+      'var before = await page_info();',
+      'await fill(named(before, "Name"), "Completed before stale ref");',
+      'await click(named(before, "Save"));',
+    ].join('\n') });
+    assert.equal(partial.data.error.code, 'STALE_REF');
+    assert(partial.data.steps.some(step => step.helper === 'fill' && step.completed && step.executed), 'Exec failures must retain completed browser operations');
+    snapshot = await invoke('browser_snapshot');
+    assert.equal(snapshot.elements.find(item => item.name === 'Name').value, 'Completed before stale ref');
+    const longAnswer = 'A useful answer with enough detail. '.repeat(16);
+    const { data: batch, response: batchResponse } = await session.call('browser_batch', { actions: [
+      { action: 'fill', ref: find('Name'), text: longAnswer },
+      { action: 'select', ref: find('Color'), values: ['blue'] },
+      { action: 'click', ref: find('Save') },
+    ], wait_for: { text: `Saved ${longAnswer}` }, include_screenshot: true });
+    assert.equal(batchResponse.isError, undefined, JSON.stringify(batch));
+    assert(batchResponse.content.some(item => item.type === 'image'), 'The final batch observation must support an inline screenshot');
+    assert.equal(batch.completed, true);
+    assert.equal(batch.results.length, 3);
+    snapshot = batch.snapshot;
+    assert.equal(snapshot.elements.find(element => element.name === 'Name').value, longAnswer, 'Answers longer than 300 characters must remain verifiable');
+    snapshot = (await invoke('browser_click', { ref: find('Delayed save'), wait_for: { text: 'Delayed result' } })).snapshot;
+    assert(snapshot.frames[0].text.includes('Delayed result'), 'The returned action snapshot must reflect the requested asynchronous update');
+    const timeoutResult = await invoke('browser_click', { ref: find('Count click'), wait_for: { text: 'Impossible text', timeout_ms: 200 } });
+    assert.equal(timeoutResult.executed, true);
+    assert.equal(timeoutResult.wait.matched, false);
+    snapshot = timeoutResult.snapshot;
+    assert(snapshot.frames[0].text.includes('Clicked 1 time(s)'), 'A wait timeout must not replay input');
+    const changed = await invoke('browser_batch', { actions: [
+      { action: 'click', ref: find('Change planned target') }, { action: 'click', ref: find('Bottom') },
+    ] });
+    assert.equal(changed.completed, false);
+    assert.equal(changed.results.length, 1);
+    assert.equal(changed.stopped.error.code, 'STALE_REF');
+    snapshot = changed.snapshot;
+    assert(!snapshot.frames[0].text.includes('Unexpected bottom click'));
+    const removedBatch = await invoke('browser_batch', { actions: [
+      { action: 'click', ref: find('Remove planned target') }, { action: 'click', ref: find('Changed target') },
+    ] });
+    assert.equal(removedBatch.results.length, 1);
+    assert.equal(removedBatch.stopped.error.code, 'STALE_REF');
+    snapshot = removedBatch.snapshot;
+    const navigatedBatch = await invoke('browser_batch', { actions: [
+      { action: 'click', ref: find('Navigate away') }, { action: 'fill', ref: find('Name'), text: 'Must not execute on a new page' },
+    ] });
+    assert.equal(navigatedBatch.completed, false);
+    assert.equal(navigatedBatch.results.length, 1);
+    assert.equal(navigatedBatch.stopped.reason, 'page_changed');
+    snapshot = (await invoke('browser_navigate', { url: base })).snapshot;
+    snapshot = (await invoke('browser_wait', { milliseconds: 200 })).snapshot;
+    const upload = await invoke('browser_upload', { ref: find('Frame upload'), paths: [uploadPath], wait_for: { text: 'Upload received from local MCP host' } });
+    assert.equal(upload.files[0].name, 'payload.txt');
+    assert.equal(upload.wait.matched, true);
+    snapshot = upload.snapshot;
+    snapshot = (await invoke('browser_click', { ref: find('Cover frame') })).snapshot;
+    const covered = await session.call('browser_click', { ref: find('Browse files') });
+    assert.equal(covered.data.error.code, 'ELEMENT_NOT_ACTIONABLE', 'Paused-frame fallback must hit-test its ancestor frames');
+    snapshot = await invoke('browser_snapshot');
+    assert(!snapshot.frames[0].text.includes('Unexpected overlay click'), 'Covered frame input must not click a parent overlay');
+    snapshot = (await invoke('browser_click', { ref: find('Uncover frame') })).snapshot;
+    await writeFile(uploadPath, 'Upload received through intercepted chooser');
+    const chooserClick = await invoke('browser_click', { ref: find('Browse files') });
+    assert(chooserClick.file_chooser, 'Paused-frame clicks must open an interceptable chooser');
+    snapshot = chooserClick.snapshot;
+    const chooserUpload = await invoke('browser_upload', { paths: [uploadPath], wait_for: { text: 'Upload received through intercepted chooser' } });
+    assert.equal(chooserUpload.executed, true, 'An intercepted chooser must accept files without operating a native picker');
+    assert.equal(chooserUpload.wait.matched, true, 'The second upload must produce a new page update');
+    snapshot = chooserUpload.snapshot;
+    const cropped = await session.call('browser_screenshot', { ref: find('Save') });
+    assert(cropped.data.clip.width > 0 && cropped.data.clip.height > 0);
+    assert(cropped.response.content.some(item => item.type === 'image'));
+    const missingFile = await session.call('browser_upload', { ref: find('Frame upload'), paths: [join(uploadDir, 'missing.txt')] });
+    assert.equal(missingFile.data.error.code, 'UPLOAD_FILE_UNAVAILABLE');
     snapshot = (await invoke('browser_click', { ref: find('Confirm') })).snapshot;
     assert.equal(snapshot.dialog.type, 'confirm');
     assert.equal(snapshot.dialog.message, 'Confirm action?');
@@ -363,6 +544,11 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     assert.notEqual(newTab.tab_id, tabId);
     await invoke('browser_select_tab', { tab_id: tabId });
     await invoke('browser_close_tab', { tab_id: newTab.tab_id });
+    snapshot = (await invoke('browser_navigate', { url: `${base}/scroller` })).snapshot;
+    assert.equal(snapshot.elements.find(element => element.name === 'Nested bottom').in_viewport, false);
+    snapshot = (await invoke('browser_scroll', { y: 10000 })).snapshot;
+    assert.equal(snapshot.elements.find(element => element.name === 'Nested bottom').in_viewport, true, 'Default scrolling must move the app container when the window cannot scroll');
+    snapshot = (await invoke('browser_navigate', { url: `${base}/other` })).snapshot;
     assert.equal((await invoke('browser_tabs')).tabs.length, 1);
     await invoke('browser_new_tab');
     await session.client.close();
@@ -392,11 +578,27 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     await invoke('browser_select_tab', { tab_id: restoredTab.tab_id });
     const count = await invoke('browser_evaluate', { expression: 'window.timeoutCount' });
     assert.equal(count.result, 1, 'A timed out mutation must never be replayed during recovery');
+    const execTimeout = await session.call('browser_exec', { code: [
+      'var observed = await page_info();',
+      'await click(observed.elements.find(item => item.name === "Count click").ref, {wait_for: {text: "Clicked 1 time(s)"}});',
+      'print("Input completed");',
+      'while (true) {}',
+    ].join('\n'), timeout_ms: 2000 });
+    assert.equal(execTimeout.data.error.code, 'EXEC_TIMEOUT', JSON.stringify(execTimeout.data));
+    assert.equal(execTimeout.data.output, 'Input completed\n');
+    assert(execTimeout.data.steps.some(step => step.helper === 'click' && step.completed && step.executed));
+    const execRecovered = await invoke('browser_status');
+    assert.equal(execRecovered.tabs.length, 2, 'Exec timeout recovery must preserve tabs');
+    const recoveredTab = execRecovered.tabs.find(tab => tab.url === base + '/other');
+    await invoke('browser_select_tab', { tab_id: recoveredTab.tab_id });
+    const executedOnce = await invoke('browser_evaluate', { expression: 'window.clicks' });
+    assert.equal(executedOnce.result, 1, 'Exec timeout recovery must never replay completed input');
     assert.equal(session.stderr(), '');
   } finally {
     await frameObserver?.close();
     await session?.client.close();
     await new Promise(resolve => site.close(resolve));
     await fixture.close();
+    await rm(uploadDir, { recursive: true, force: true });
   }
 });

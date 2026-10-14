@@ -34,6 +34,6 @@ export async function withDeadline(operation, milliseconds, timeoutError) {
 }
 
 export function needsReconnect(error) {
-  return ['REQUEST_TIMEOUT', 'SESSION_TIMEOUT', 'SNAPSHOT_TIMEOUT', 'CDP_UNAVAILABLE', 'CDP_UNRESPONSIVE', 'CONNECTION_RESET'].includes(error.code) ||
+  return ['REQUEST_TIMEOUT', 'SESSION_TIMEOUT', 'SNAPSHOT_TIMEOUT', 'CDP_UNAVAILABLE', 'CDP_UNRESPONSIVE', 'CONNECTION_RESET', 'EXEC_TIMEOUT', 'EXEC_WORKER_FAILED', 'EXEC_ABORTED'].includes(error.code) ||
     /browser has been closed|browser disconnected|connection closed|websocket.*(?:closed|hang up)/i.test(error.message);
 }

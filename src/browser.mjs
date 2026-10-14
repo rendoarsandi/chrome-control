@@ -1,11 +1,18 @@
 import { randomUUID } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
+import { basename, extname, isAbsolute } from 'node:path';
 import { canForward, forwardChrome } from './adb.mjs';
 import { connectTransport } from './cdp-transport.mjs';
-import { collectDOM } from './dom.mjs';
+import { collectDOM, scrollDOM } from './dom.mjs';
 import { ControlError, describeError, withDeadline } from './errors.mjs';
 
 // Handle release is housekeeping, never a prerequisite for the next request.
 const release = handle => { handle?.dispose().catch(() => {}); };
+const identity = node => JSON.stringify({
+  tag: node.tagName, type: node.getAttribute('type'), label: node.getAttribute('aria-label'),
+  text: ['BUTTON', 'A', 'SUMMARY'].includes(node.tagName) || node.getAttribute('role') === 'button' ? node.textContent : null,
+  value: ['radio', 'checkbox'].includes(node.type) ? node.value : null,
+});
 
 export class BrowserController {
   constructor(chromium, config, { repairForward = false } = {}) {
@@ -15,6 +22,7 @@ export class BrowserController {
     this.selected = null;
     this.pages = new Map();
     this.dialogs = new Map();
+    this.fileChoosers = new Map();
     this.refs = new Map();
     this.handles = [];
     this.sequence = 0;
@@ -23,6 +31,7 @@ export class BrowserController {
     this.abort = new AbortController();
     this.repairForward = repairForward;
     this.cdp = null;
+    this.execSessions = new Map();
     this.targets = new Map();
     this.titles = new Map();
     this.outcome = {};
@@ -35,7 +44,9 @@ export class BrowserController {
 
   noteInput(action, tabId) {
     this.assertActive();
-    this.outcome = { action, ...(tabId ? { tab_id: tabId } : {}), may_have_executed: true };
+    this.outcome = this.outcome.action === 'batch'
+      ? { ...this.outcome, current_action: action, may_have_executed: true }
+      : { action, ...(tabId ? { tab_id: tabId } : {}), may_have_executed: true };
   }
 
   async connect() {
@@ -44,10 +55,13 @@ export class BrowserController {
     await this.clearRefs();
     this.pages.clear();
     this.dialogs.clear();
+    this.fileChoosers.clear();
     this.targets.clear();
     this.titles.clear();
     this.cdp = null;
     this.selected = null;
+    for (const session of this.execSessions.values()) session.detach().catch(() => {});
+    this.execSessions.clear();
     const open = async timeout => {
       this.assertActive();
       const started = Date.now();
@@ -122,9 +136,13 @@ export class BrowserController {
     await this.clearRefs();
     this.pages.clear();
     this.dialogs.clear();
+    for (const chooser of this.fileChoosers.values()) release(chooser.element());
+    this.fileChoosers.clear();
     this.targets.clear();
     this.titles.clear();
     this.selected = null;
+    for (const session of this.execSessions.values()) session.detach().catch(() => {});
+    this.execSessions.clear();
     await withDeadline(() => browser?.close(), 1000).catch(() => {});
   }
 
@@ -134,7 +152,11 @@ export class BrowserController {
     const id = `tab_${this.prefix}_${++this.sequence}`;
     this.pages.set(id, page);
     page.on('dialog', dialog => this.dialogs.set(page, dialog));
-    page.on('close', () => this.dialogs.delete(page));
+    page.on('close', () => { this.dialogs.delete(page); this.fileChoosers.delete(page); });
+    page.on('framedetached', frame => {
+      this.execSessions.get(frame)?.detach().catch(() => {});
+      this.execSessions.delete(frame);
+    });
     return id;
   }
 
@@ -412,10 +434,6 @@ export class BrowserController {
       this.noteInput('click', this.register(page));
       return target.click({ timeout, noWaitAfter: true });
     }
-    if (await target.ownerFrame() !== page.mainFrame()) {
-      throw new ControlError('ANIMATION_FRAMES_PAUSED', 'Chrome is not rendering this frame.',
-        'Bring Chrome to the foreground and keep the screen unlocked, then take a fresh snapshot before clicking.');
-    }
     // Sample geometry using timers instead of animation frames. Only send native
     // mouse input when the same retained node is visible, enabled and uncovered.
     const point = await target.evaluate(async node => {
@@ -448,8 +466,48 @@ export class BrowserController {
       throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'The target is hidden, disabled, covered or moving while Chrome rendering is paused.',
         'Bring Chrome to the foreground and keep the screen unlocked. Inspect a fresh snapshot or screenshot before trying again.');
     }
+    let nativePoint = point;
+    const frame = await target.ownerFrame();
+    if (frame !== page.mainFrame()) {
+      // Playwright's CDP bounding box is expressed in the top-level viewport.
+      // Check every ancestor frame at that exact point, not at its center:
+      // an overlay may cover only the part containing the requested control.
+      const box = await target.boundingBox();
+      if (!box || Math.abs(box.width - point.width) > 0.5 || Math.abs(box.height - point.height) > 0.5) {
+        throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'Cannot safely map this paused frame into viewport coordinates.', 'Keep Chrome foregrounded and inspect a fresh screenshot. Transformed frames require visual interaction.');
+      }
+      nativePoint = { x: box.x + point.x - point.left, y: box.y + point.y - point.top };
+      for (let current = frame; current?.parentFrame(); current = current.parentFrame()) {
+        const parent = current.parentFrame();
+        const host = await current.frameElement();
+        let parentHost;
+        try {
+          let origin = { x: 0, y: 0 };
+          if (parent !== page.mainFrame()) {
+            parentHost = await parent.frameElement();
+            const bounds = await parentHost.boundingBox();
+            const geometry = await parentHost.evaluate(node => ({ width: node.offsetWidth, height: node.offsetHeight, left: node.clientLeft, top: node.clientTop }));
+            if (!bounds || Math.abs(bounds.width - geometry.width) > 0.5 || Math.abs(bounds.height - geometry.height) > 0.5) {
+              throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'A paused ancestor frame is transformed or hidden.', 'Keep Chrome foregrounded and inspect a screenshot before using coordinates.');
+            }
+            origin = { x: bounds.x + geometry.left, y: bounds.y + geometry.top };
+          }
+          const uncovered = await host.evaluate((node, point) => {
+            if (!node.isConnected || getComputedStyle(node).transform !== 'none' || point.x < 0 || point.y < 0 || point.x >= innerWidth || point.y >= innerHeight) return false;
+            let hit = document.elementFromPoint(point.x, point.y);
+            while (hit?.shadowRoot) {
+              const next = hit.shadowRoot.elementFromPoint(point.x, point.y);
+              if (!next || next === hit) break;
+              hit = next;
+            }
+            return hit === node;
+          }, { x: nativePoint.x - origin.x, y: nativePoint.y - origin.y });
+          if (!uncovered) throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'A paused iframe is outside the viewport or covered at the requested point.', 'Bring Chrome foreground and inspect a fresh snapshot or screenshot.');
+        } finally { release(host); release(parentHost); }
+      }
+    }
     this.noteInput('click', this.register(page));
-    await page.mouse.click(point.x, point.y);
+    await page.mouse.click(nativePoint.x, nativePoint.y);
   }
 
   async action(name, args) {
@@ -458,7 +516,24 @@ export class BrowserController {
     let target;
     try {
       if (args.ref) target = await this.target(args.ref, page);
-      const timeout = this.config.actionTimeout;
+      await this.perform(page, id, name, args, target);
+      if (name !== 'wait') this.outcome.executed = true;
+    } catch (error) {
+      if (error.code === 'STALE_REF') throw error;
+      await this.clearRefs();
+      if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'The action opened a blocking JavaScript dialog.', 'Call browser_handle_dialog. Inspect the page before repeating the action.', { action: name, may_have_executed: true, dialog: this.dialogInfo(page) });
+      throw error;
+    } finally {
+      release(target);
+    }
+    await this.clearRefs();
+    return this.observe(page, id, { action: name, executed: true }, args.wait_for, name === 'wait');
+  }
+
+  async perform(page, id, name, args, target, timeout = this.config.actionTimeout) {
+    const chooser = fileChooser => this.fileChoosers.set(page, fileChooser);
+    if (name === 'click') page.on('filechooser', chooser);
+    try {
       await this.untilDialog(page, async () => {
         this.assertActive();
         if (!['click', 'wait'].includes(name)) this.noteInput(name, id);
@@ -471,54 +546,210 @@ export class BrowserController {
             else await page.keyboard.press(args.key);
             break;
           case 'scroll':
-            if (target) await target.evaluate((node, { x, y }) => node.scrollBy({ left: x, top: y, behavior: 'instant' }), { x: args.x, y: args.y });
-            else await page.evaluate(({ x, y }) => window.scrollBy({ left: x, top: y, behavior: 'instant' }), { x: args.x, y: args.y });
+            if (args.into_view && !target) throw new ControlError('REF_REQUIRED', 'into_view requires an element ref.', 'Choose a current element ref from browser_snapshot.');
+            if (args.into_view) await target.evaluate(node => node.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }));
+            else if (target) await target.evaluate((node, { x, y }) => node.scrollBy({ left: x, top: y, behavior: 'instant' }), args);
+            else await page.evaluate(scrollDOM, { x: args.x, y: args.y });
             break;
           case 'navigate': await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout }); break;
           case 'back': await page.goBack({ waitUntil: 'domcontentloaded', timeout }); break;
-          case 'wait': await page.waitForTimeout(args.milliseconds); break;
+          case 'wait': if (!args.wait_for) await page.waitForTimeout(args.milliseconds); break;
           case 'tap': await page.mouse.click(args.x, args.y); break;
           default: throw new Error(`Unknown action: ${name}`);
         }
       });
-      if (name !== 'wait') this.outcome.executed = true;
+      // Allow asynchronous file-chooser events to arrive before interception is
+      // removed. User clicks outside a tool call retain the native picker.
+      if (name === 'click') await page.waitForTimeout(100);
+    } finally { if (name === 'click') page.off('filechooser', chooser); }
+  }
+
+  async waitFor(page, condition) {
+    const timeout = condition.timeout_ms ?? 5000;
+    try {
+      const handle = await page.waitForFunction(({ text, text_absent, url }) => {
+        const body = document.body?.innerText || '';
+        return (text === undefined || body.includes(text)) &&
+          (text_absent === undefined || !body.includes(text_absent)) &&
+          (url === undefined || location.href.includes(url));
+      }, condition, { polling: 100, timeout });
+      release(handle);
+      return { matched: true };
     } catch (error) {
-      if (error.code === 'STALE_REF') throw error;
-      await this.clearRefs();
-      if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'The action opened a blocking JavaScript dialog.', 'Call browser_handle_dialog. Inspect the page before repeating the action.', { action: name, may_have_executed: true, dialog: this.dialogInfo(page) });
-      throw error;
+      this.assertActive();
+      if (error.name !== 'TimeoutError') throw error;
+      return { matched: false, timeout_ms: timeout, recovery: 'Inspect the returned snapshot. The action is not repeated when a condition times out.' };
+    }
+  }
+
+  async observe(page, id, output, condition, alreadyWaited = false) {
+    if (!this.dialogs.has(page) && !this.fileChoosers.has(page)) {
+      if (condition) {
+        try { output.wait = await this.waitFor(page, condition); }
+        catch (error) { output.wait_error = describeError(error); }
+      } else if (!alreadyWaited) await page.waitForTimeout(150);
+    }
+    this.assertActive();
+    const chooser = this.fileChoosers.get(page);
+    if (chooser) output.file_chooser = { multiple: chooser.isMultiple(), recovery: 'Call browser_upload with local file paths. The native file picker was intercepted.' };
+    try {
+      return { ...output, snapshot: await this.snapshot({ tab_id: id }) };
+    } catch (error) {
+      return { ...output, observation_error: describeError(error), recovery: 'Inspect the page before repeating any completed actions.' };
+    }
+  }
+
+  async batch({ tab_id, actions, wait_for }) {
+    const { page, id } = await this.page(tab_id);
+    if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is blocking this tab.', 'Call browser_handle_dialog.');
+    const targets = [];
+    const results = [];
+    let stop;
+    let navigated = false;
+    const watchedFrames = new Set([page.mainFrame()]);
+    const onNavigation = frame => { if (watchedFrames.has(frame)) navigated = true; };
+    const onPopup = () => { navigated = true; };
+    const until = Date.now() + Math.max(1, this.config.requestTimeout - Math.min(this.config.actionTimeout, this.config.requestTimeout / 3) - 2000);
+    try {
+      // Resolve the entire plan against one observed snapshot before any input.
+      // Retained nodes cannot silently become positional matches on a new page.
+      for (const action of actions) {
+        const node = action.ref ? await this.target(action.ref, page) : null;
+        targets.push({ node, signature: node ? await node.evaluate(identity) : null });
+        if (node) watchedFrames.add(await node.ownerFrame());
+      }
+      page.on('framenavigated', onNavigation);
+      page.on('popup', onPopup);
+      for (const [index, action] of actions.entries()) {
+        this.assertActive();
+        if (navigated || this.dialogs.has(page) || this.fileChoosers.has(page)) {
+          stop = { index, reason: navigated ? 'page_changed' : this.dialogs.has(page) ? 'dialog_open' : 'file_chooser_open' };
+          break;
+        }
+        if (Date.now() >= until) { stop = { index, reason: 'time_budget' }; break; }
+        const { node, signature } = targets[index];
+        this.outcome = { action: 'batch', tab_id: id, action_index: index, executed: results.length > 0, results: [...results] };
+        try {
+          if (node && (!await node.evaluate(node => node.isConnected) || await node.evaluate(identity) !== signature)) {
+            throw new ControlError('STALE_REF', 'A planned element was removed or changed after an earlier action.', 'Inspect the returned snapshot and plan the remaining actions again.');
+          }
+          await this.perform(page, id, action.action, action, node, Math.min(this.config.actionTimeout, until - Date.now()));
+          this.outcome.executed = true;
+          results.push({ index, action: action.action, executed: true });
+          this.outcome = { action: 'batch', tab_id: id, executed: true, results: [...results] };
+          if (index < actions.length - 1) await page.waitForTimeout(100);
+        } catch (error) {
+          stop = { index, reason: 'action_error', error: describeError(error), ...(this.outcome.may_have_executed ? { may_have_executed: true } : {}) };
+          break;
+        }
+      }
     } finally {
-      release(target);
+      page.off('framenavigated', onNavigation);
+      page.off('popup', onPopup);
+      targets.forEach(({ node }) => release(node));
     }
     await this.clearRefs();
-    // Let immediate DOM updates settle; the snapshot is evidence, not a claim of task completion.
-    if (name !== 'wait') await page.waitForTimeout(250);
-    this.assertActive();
-    try {
-      return { action: name, executed: true, snapshot: await this.snapshot({ tab_id: id }) };
-    } catch (error) {
-      return { action: name, executed: true, observation_error: describeError(error), recovery: 'The action executed, but its snapshot failed. Inspect the page before repeating the action.' };
-    }
+    return this.observe(page, id, { action: 'batch', executed: results.length > 0, completed: results.length === actions.length, results, ...(stop ? { stopped: stop } : {}) }, wait_for);
   }
 
-  async screenshot(tabId) {
-    const { page, id } = await this.page(tabId);
-    if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is open in this tab.', 'Read browser_snapshot, then call browser_handle_dialog.', { dialog: this.dialogInfo(page) });
-    const data = await page.screenshot({ type: 'jpeg', quality: 70, scale: 'css', fullPage: false, timeout: this.config.actionTimeout });
-    return { tab_id: id, url: page.url(), data: data.toString('base64') };
-  }
-
-  async evaluate({ expression, tab_id }) {
+  async upload({ tab_id, ref, paths, wait_for }) {
     const { page, id } = await this.page(tab_id);
+    if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is blocking this tab.', 'Call browser_handle_dialog.');
+    const chooser = !ref && this.fileChoosers.get(page);
+    if (!ref && !chooser) throw new ControlError('FILE_INPUT_REQUIRED', 'No file input reference or intercepted file chooser is available.', 'Use a file_input ref from browser_snapshot or click Browse files, then call browser_upload.');
+    const target = ref ? await this.target(ref, page) : chooser.element();
+    try {
+      const input = await target.evaluate(node => ({ file: node.tagName === 'INPUT' && node.type === 'file', multiple: node.multiple, attached: node.isConnected }));
+      if (!input.file || !input.attached) throw new ControlError('FILE_INPUT_REQUIRED', 'The upload target is not a connected file input.', 'Inspect a fresh snapshot and choose the correct file_input ref.');
+      if (paths.length > 1 && !input.multiple) throw new ControlError('FILE_COUNT_INVALID', 'This input accepts only one file.', 'Provide one file path for this upload control.');
+      let total = 0;
+      const files = [];
+      for (const path of paths) {
+        if (!isAbsolute(path)) throw new ControlError('UPLOAD_PATH_INVALID', 'Upload paths must be absolute local paths.', 'Use the full path on the machine running the MCP server.');
+        let metadata;
+        try { metadata = await stat(path); }
+        catch { throw new ControlError('UPLOAD_FILE_UNAVAILABLE', `Cannot read local file: ${path}`, 'Check the path and file permissions on the MCP server host.'); }
+        total += metadata.size;
+        if (!metadata.isFile() || metadata.size > 20 * 1024 * 1024 || total > 50 * 1024 * 1024) {
+          throw new ControlError('UPLOAD_FILE_LIMIT', 'Uploads require regular files up to 20 MiB each and 50 MiB total.', 'Choose smaller files and upload at most ten files per call.');
+        }
+        const buffer = await readFile(path);
+        if (buffer.length !== metadata.size) throw new ControlError('UPLOAD_FILE_CHANGED', 'An upload file changed while being read.', 'Finish saving the file before uploading it.');
+        const mimeType = ({ '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json' })[extname(path).toLowerCase()] || 'application/octet-stream';
+        files.push({ name: basename(path), mimeType, buffer });
+      }
+      // Payloads work when Chrome and this Node process have different filesystems.
+      this.noteInput('upload', id);
+      await target.setInputFiles(files, { timeout: this.config.actionTimeout });
+      this.assertActive();
+      this.outcome.executed = true;
+      this.fileChoosers.delete(page);
+      if (chooser) release(target);
+      await this.clearRefs();
+      return this.observe(page, id, { action: 'upload', executed: true, files: files.map(file => ({ name: file.name, size: file.buffer.length })) }, wait_for);
+    } finally { if (ref) release(target); }
+  }
+
+  async screenshot({ tab_id, ref } = {}) {
+    const { page, id } = await this.page(tab_id);
+    if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is open in this tab.', 'Read browser_snapshot, then call browser_handle_dialog.', { dialog: this.dialogInfo(page) });
+    let target;
+    try {
+      let clip;
+      if (ref) {
+        target = await this.target(ref, page);
+        await target.evaluate(node => node.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }));
+        const box = await target.boundingBox();
+        const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+        if (box) {
+          const x = Math.max(0, box.x), y = Math.max(0, box.y);
+          clip = { x, y, width: Math.min(viewport.width, box.x + box.width) - x, height: Math.min(viewport.height, box.y + box.height) - y };
+        }
+        if (!clip || clip.width <= 0 || clip.height <= 0) throw new ControlError('ELEMENT_NOT_VISIBLE', 'The screenshot target has no visible viewport area.', 'Scroll its parent into view and inspect a fresh snapshot.');
+      }
+      const data = await page.screenshot({ type: 'jpeg', quality: 70, scale: 'css', fullPage: false, ...(clip ? { clip } : {}), timeout: this.config.actionTimeout });
+      return { tab_id: id, url: page.url(), ...(clip ? { clip } : {}), data: data.toString('base64') };
+    } finally { release(target); }
+  }
+
+  async evaluate({ expression, tab_id, frame_id }) {
+    const { page, id } = await this.page(tab_id);
+    const frame = frame_id ? page.frames()[Number(frame_id.replace('frame_', ''))] : page.mainFrame();
+    if (!frame) throw new ControlError('FRAME_UNAVAILABLE', 'This frame is no longer available.', 'Inspect a fresh snapshot and choose a current frame_id.');
     if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is blocking evaluation.', 'Call browser_handle_dialog.', { dialog: this.dialogInfo(page) });
     await this.clearRefs();
     this.noteInput('evaluate', id);
-    const result = await page.evaluate(expression);
+    const result = await frame.evaluate(expression);
     this.assertActive();
     this.outcome.executed = true;
     const serialized = JSON.stringify(result ?? null);
     const output = { tab_id: id, executed: true, ...(serialized.length > 20000 ? { result_text: serialized.slice(0, 20000), truncated: true } : { result: result ?? null }) };
     try { return { ...output, snapshot: await this.snapshot({ tab_id: id }) }; }
     catch (error) { return { ...output, observation_error: describeError(error), recovery: 'Evaluation executed, but its snapshot failed. Inspect the page before repeating it.' }; }
+  }
+
+  async execCDP({ tab_id, frame_id, method, params = {} }) {
+    const { page, id } = await this.page(tab_id);
+    const frame = frame_id ? page.frames()[Number(frame_id.replace('frame_', ''))] : page.mainFrame();
+    if (!frame) throw new ControlError('FRAME_UNAVAILABLE', 'This frame is no longer available.', 'Inspect page_info() and choose a current frame_id.');
+    if (/^(Browser|Target)\./.test(method)) throw new ControlError('CDP_SCOPE_INVALID', 'CDP commands are scoped to the selected web page.', 'Use list_tabs(), new_tab(), select_tab() and close_tab() for tab management.');
+    if (!this.execSessions.has(frame)) {
+      let session;
+      try { session = await page.context().newCDPSession(frame === page.mainFrame() ? page : frame); }
+      catch (error) {
+        if (/does not have a separate CDP session/.test(error.message)) throw new ControlError('FRAME_CDP_UNAVAILABLE',
+          'This iframe shares its parent CDP session.', 'Use js(expression, {frame_id}) for this iframe, or leave frame_id unset for page-scoped CDP commands.');
+        throw error;
+      }
+      if (this.stopped) { session.detach().catch(() => {}); this.assertActive(); }
+      this.execSessions.set(frame, session);
+    }
+    this.noteInput('cdp', id);
+    const result = await this.execSessions.get(frame).send(method, params);
+    this.assertActive();
+    this.outcome.executed = true;
+    await this.clearRefs();
+    if (JSON.stringify(result).length > 1000000) throw new ControlError('CDP_RESULT_LIMIT', 'CDP returned more than one megabyte.', 'Request a smaller protocol result.');
+    return result;
   }
 }

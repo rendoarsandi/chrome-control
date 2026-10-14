@@ -36,7 +36,14 @@ export async function forwardChrome(config, run = execute, { signal, reconnect =
     // Wireless ports can change without changing the MCP configuration. An
     // explicitly supplied address is safe to reconnect with existing ADB keys.
     if (/^(?:\[[\da-f:]+\]|[\w.-]+):\d{1,5}$/i.test(serial)) {
-      if (reconnect) await adb(['disconnect', serial]);
+      if (reconnect) {
+        try { await adb(['disconnect', serial]); }
+        catch (error) {
+          // A new wireless port has no previous connection to disconnect.
+          // Other failures (including cancellation) must still stop recovery.
+          if (signal?.aborted || !/error: no such device\b/i.test(error.stderr || error.message)) throw error;
+        }
+      }
       await adb(['connect', serial]);
     }
     await adb(['-s', serial, 'shell', 'am', 'start', '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', config.package]);

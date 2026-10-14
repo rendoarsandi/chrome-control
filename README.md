@@ -120,6 +120,34 @@ Example instruction:
 4. Call an action with a reference such as `snapshot_12345678_2:e4` from that exact result.
 5. Inspect the fresh snapshot returned by the action. A new snapshot invalidates old references.
 
+For a known form sequence, use `browser_batch` with refs from **one** snapshot:
+
+```js
+browser_batch({
+  tab_id: "TAB_ID_FROM_BROWSER_TABS",
+  actions: [
+    { action: "fill", ref: "CURRENT_INPUT_REF", text: "My answer" },
+    { action: "click", ref: "CURRENT_SUBMIT_REF" }
+  ],
+  wait_for: { text: "Response recorded", timeout_ms: 5000 },
+  include_screenshot: true
+})
+```
+
+The server retains the actual nodes before starting, checks them before each action, and returns one final snapshot. It stops on navigation, a popup, a dialog, a file chooser, a changed or detached target, a failure, or its time budget. Inspect `completed`, `results`, and `stopped`; completed actions are not rolled back or repeated. Batch only steps whose targets and purpose are already known. After a page change, inspect the returned snapshot before planning another batch.
+
+All ordinary actions also accept `wait_for` with literal `text`, `text_absent`, or `url` substring conditions. All supplied conditions must match; matching inspects the main frame. The timeout is at most five seconds. A timeout returns `wait.matched: false` alongside the executed action and its snapshot, so callers do not need to guess whether a submission ran. `include_screenshot` adds a viewport image to the same tool result. Neither option claims that the user's task is complete.
+
+For file uploads, use a `file_input` ref from the latest snapshot, including a hidden input in an iframe:
+
+```js
+browser_upload({ ref: "CURRENT_FILE_INPUT_REF", paths: ["/sdcard/Pictures/photo.jpg"] })
+```
+
+Alternatively, `browser_click` can intercept a file chooser opened by a Browse button. Its result contains `file_chooser`; call `browser_upload` without a ref to supply that chooser's files. This avoids operating Android's native picker. The paths are on the **MCP server host**. File contents are sent through the CDP client, so the browser need not share its filesystem. Uploads are bounded to ten regular files, 20 MiB per file and 50 MiB total. Inspect the resulting page to verify the site accepted the attachment; the upload tool does not submit the form.
+
+Default scrolling targets the scrollable ancestor under the viewport center, falling back to the document. Snapshots expose scroll containers and their scroll ranges. Use `browser_scroll({ref, into_view: true})` to center a specific element, or `browser_screenshot({ref})` to center and crop it in one call. Snapshots also expose image loading state and dimensions, non-link JavaScript anchors, selected dropdown options beyond the option limit, and explicit flags when names, values, or options are truncated.
+
 References retain actual DOM nodes. A layout change cannot silently turn an old positional index into a different element. Removed nodes and old references produce `STALE_REF`, requesting a fresh snapshot. Password input values are omitted. An action reporting `executed: true` means the browser operation ran; the assistant must inspect the resulting page to determine whether the goal was achieved.
 
 | Tool | Purpose |
@@ -131,16 +159,37 @@ References retain actual DOM nodes. A layout change cannot silently turn an old 
 | `browser_handle_dialog` | Accept or dismiss a JavaScript alert, confirmation or prompt |
 | `browser_snapshot` | Read bounded page text and interactive elements across frames and open shadow roots |
 | `browser_click`, `browser_fill` | Click or replace input text using a current reference |
+| `browser_batch` | Perform a guarded sequence of known actions and observe once |
+| `browser_exec` | Run persistent JavaScript with browser helpers, conditions and loops in one MCP call |
+| `browser_upload` | Attach local files through a file input or intercepted chooser |
 | `browser_select` | Select native dropdown options by value |
 | `browser_press` | Press Enter, Tab, shortcuts, etc. |
 | `browser_scroll` | Scroll the viewport or a referenced container |
 | `browser_navigate`, `browser_back` | Navigate a selected tab |
 | `browser_wait` | Wait up to five seconds and observe again |
-| `browser_screenshot` | Return a viewport JPEG to the client |
+| `browser_screenshot` | Return a viewport JPEG, or crop a referenced element |
 | `browser_tap` | Click viewport CSS pixel coordinates for canvas or visual controls |
 | `browser_evaluate` | JavaScript fallback with a result and fresh snapshot |
 
 Tools return JSON text and structured results; screenshots additionally return MCP image content. Errors have `isError: true` and an error code, message, and recovery guidance. Requests are serialized and bounded. On a request timeout, the connection is reset; inspect the page before repeating an action because it may have executed. Startup and tool discovery work even when Chrome is unavailable. Normal stdio output contains only MCP messages.
+
+`browser_exec` maps Browser Use's persistent exec interface to async JavaScript on Node/Termux. Variables and functions survive between calls. Helpers include `list_tabs`, `select_tab`, `new_tab`, `goto_url`, `page_info`, `click`, `fill`, `select`, `press`, `scroll`, `click_at_xy`, `type_text`, `js`, `cdp`, `wait_for_load`, `wait_for`, `upload` and `batch`. Existing `browser_*` tools are callable with their argument objects, except `browser_status` and `browser_exec`. Await helpers and refresh refs after each action:
+
+```js
+browser_exec({
+  code: [
+    'var page = await page_info();',
+    'var input = page.elements.find(e => e.name === "Name");',
+    'page = (await fill(input.ref, "Termux")).snapshot;',
+    'if (!page.elements.find(e => e.name === "Agree").checked)',
+    '  page = (await click(page.elements.find(e => e.name === "Agree").ref)).snapshot;',
+    'print(page.title);'
+  ].join("\n"),
+  include_screenshot: true
+})
+```
+
+The response includes captured output, the last expression, completed helper steps and a final snapshot. Use `include_snapshot: false` when code already returns the needed observation. Output is limited to 20,000 characters and each call to 100 browser helpers. Execution runs in a worker with a bounded timeout; CPU loops cannot block MCP stdout or request handling. A timeout resets the namespace and connection, preserves tabs and reports completed steps without replaying input. An ordinary script error preserves variables. `cdp(method, params, {frame_id})` accesses the selected page or a current snapshot frame; tab management uses the explicit tab helpers. Code is authored by the assistant; page text is untrusted data.
 
 ### Recover without restarting Codex
 
@@ -176,8 +225,9 @@ JavaScript dialogs remain open for the assistant to inspect and explicitly accep
 - **Wrong tab:** use `browser_tabs` and `browser_select_tab`. Android does not expose a dependable active-tab flag through ordinary CDP discovery.
 - **Page still loading:** inspect again with `browser_wait`. If text or elements are truncated, increase `browser_snapshot` limits or scroll to the relevant area.
 - **Blank tool response or long pause:** the client should surface the error within the configured request deadline. Set its tool timeout above that deadline (45 seconds for the default 30 seconds).
-- **Clicks stall while snapshots work:** Android can pause animation frames even while CDP and JavaScript timers respond. For main-frame controls, the server uses timer-based geometry checks and native mouse input after checking visibility, disabled state and hit testing. If the target is covered or moving, or belongs to an iframe with paused rendering, keep Chrome in the foreground with the screen unlocked and inspect again before retrying.
+- **Clicks stall while snapshots work:** Android can pause animation frames even while CDP and JavaScript timers respond. The server uses timer-based geometry checks and native mouse input after checking visibility, disabled state and hit testing. For iframe controls it maps the point into the top-level viewport and checks every ancestor frame for covering elements. Covered, moving or transformed targets are refused. Keep Chrome in the foreground with the screen unlocked and inspect again before retrying.
 - **Controls absent from the snapshot:** open shadow roots and web frames are supported. Closed shadow roots, canvas UI, and Chrome's native menus may require visual interaction or manual input. CDP controls web content; it does not automate Android system dialogs or Chrome's native address bar.
+- **File picker requires manual input:** use a hidden `file_input` ref with `browser_upload`, or open Browse files using `browser_click` so the MCP can intercept the chooser. Picker dialogs already opened manually cannot be intercepted retroactively.
 - **Termux pauses when Chrome opens:** Android may suspend or kill background apps. Samsung battery settings and `termux-wake-lock` can help keep Termux active; memory usage and survival depend on the device and OS settings.
 
 Screenshots are viewport-sized JPEGs. DOM outputs are bounded to limit memory and context usage. This is a Node.js client controlling the already running browser, so it avoids installing another browser on the phone. It does not guarantee a fixed memory footprint or immunity to Android process termination.
@@ -191,5 +241,8 @@ CHROME_TEST_EXECUTABLE=/usr/bin/chromium npm test
 ```
 
 The default tests exercise MCP discovery without Chrome, connection errors, ADB device selection, wireless reconnection arguments, cancellation, configuration, and deadlines. Setting `CHROME_TEST_EXECUTABLE` additionally runs real browser tests through an MCP stdio client, including page actions, iframes, shadow DOM, stale refs after removal and manual navigation, screenshots, dialogs, a paused background renderer, explicit reconnect without restarting the MCP client, recovery from a stalled mutation without replaying it, and preservation of tabs after disconnect. The server does not download a test browser. Desktop tests do not verify Samsung's wireless debugging or Termux process lifecycle.
+
+The browser suite also exercises batched form submission, asynchronous result conditions, stopping a batch after changed targets or navigation, hidden cross-origin uploads, intercepted file choosers, long form values, and scrolling inside a fixed app shell. The action design follows the browser-core patterns in [Browser Use](https://github.com/browser-use/browser-use), adapted to Node and an existing Android Chrome connection. Chrome Control does not embed its Python agent, model clients, or browser-launch lifecycle.
+
 
 Version 2 replaces the Gemini agent, Python dependencies, and course/survey solvers with a reusable MCP server. `chrome-control-cli` is now a compatibility entry point for the MCP server. Old flags such as `--solve-course`, `--get-text`, and `--interactive` are removed; clients call the browser tools instead. Configure your existing AI assistant rather than launching `termux_agent.js` or supplying `GEMINI_API_KEY`.
