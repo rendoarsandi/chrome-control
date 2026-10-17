@@ -35,6 +35,9 @@ export class BrowserController {
     this.execSessions = new Map();
     this.targets = new Map();
     this.titles = new Map();
+    this.tabInfo = new Map();
+    this.targetTabs = new Map();
+    this.transport = null;
     this.outcome = {};
     this.lastSnapshot = null;
     this.snapshotFrames = [];
@@ -63,6 +66,9 @@ export class BrowserController {
     this.fileChoosers.clear();
     this.targets.clear();
     this.titles.clear();
+    this.tabInfo = new Map();
+    this.targetTabs = new Map();
+    this.transport = null;
     this.cdp = null;
     this.selected = null;
     for (const stream of this.eventStreams.values()) stream.close();
@@ -86,6 +92,7 @@ export class BrowserController {
         browser.close().catch(() => {});
         this.assertActive();
       }
+      this.transport = transport;
       return browser;
     };
     let forwarded = false;
@@ -149,6 +156,9 @@ export class BrowserController {
     this.fileChoosers.clear();
     this.targets.clear();
     this.titles.clear();
+    this.tabInfo?.clear();
+    this.targetTabs?.clear();
+    this.transport = null;
     this.selected = null;
     for (const stream of this.eventStreams.values()) stream.close();
     this.eventStreams.clear();
@@ -157,11 +167,13 @@ export class BrowserController {
     await withDeadline(() => browser?.close(), 1000).catch(() => {});
   }
 
-  register(page) {
+  register(page, targetId) {
     this.assertActive();
     for (const [id, candidate] of this.pages) if (candidate === page) return id;
-    const id = `tab_${this.prefix}_${++this.sequence}`;
+    const id = this.targetTabs.get(targetId);
+    if (!id) throw new ControlError('TAB_UNAVAILABLE', 'The page no longer has a live Chrome target.', 'Call browser_tabs and select an available tab.');
     this.pages.set(id, page);
+    this.targets.set(page, targetId);
     page.on('dialog', dialog => this.dialogs.set(page, dialog));
     page.on('close', () => {
       this.dialogs.delete(page); this.fileChoosers.delete(page);
@@ -177,68 +189,88 @@ export class BrowserController {
   async syncPages() {
     const browser = await this.connect();
     this.assertActive();
+    if (!this.cdp) this.cdp = await browser.newBrowserCDPSession();
+    const { targetInfos } = await withDeadline(() => this.cdp.send('Target.getTargets'), 2000,
+      new ControlError('SESSION_TIMEOUT', 'Chrome did not answer a browser metadata request.',
+        'Call browser_status with reconnect: true. Keep Chrome foregrounded and the screen unlocked.'));
+    this.assertActive();
+    const available = targetInfos.filter(info => info.type === 'page' && info.url && info.url !== ':');
+    const targetIds = new Set(available.map(info => info.targetId));
+    for (const [targetId, id] of this.targetTabs) if (!targetIds.has(targetId)) {
+      this.targetTabs.delete(targetId);
+      this.tabInfo.delete(id);
+    }
+    for (const info of available) {
+      let id = this.targetTabs.get(info.targetId);
+      if (!id) {
+        id = `tab_${this.prefix}_${++this.sequence}`;
+        this.targetTabs.set(info.targetId, id);
+      }
+      this.tabInfo.set(id, info);
+    }
     const live = browser.contexts().flatMap(context => context.pages()).filter(page => !page.isClosed());
     for (const [id, page] of this.pages) if (!live.includes(page)) {
       this.pages.delete(id);
       this.targets.delete(page);
       this.titles.delete(page);
     }
-    if (!this.pages.has(this.selected)) this.selected = null;
-    if (live.length === 1 && !this.selected) this.selected = this.register(live[0]);
-    live.forEach(page => this.register(page));
-    return live;
+    for (const page of live) if (!this.targets.has(page)) {
+      let session;
+      try {
+        await withDeadline(async () => {
+          session = await page.context().newCDPSession(page);
+          const { targetInfo } = await session.send('Target.getTargetInfo');
+          this.assertActive();
+          if (this.targetTabs.has(targetInfo.targetId)) this.register(page, targetInfo.targetId);
+        }, 1500);
+      } finally { session?.detach().catch(() => {}); }
+    }
+    if (!this.tabInfo.has(this.selected)) this.selected = null;
+    if (this.tabInfo.size === 1 && !this.selected) this.selected = this.tabInfo.keys().next().value;
+    return [...this.tabInfo.values()];
   }
 
   async tabs() {
-    const live = await this.syncPages();
-    const metadataTimeout = new ControlError('SESSION_TIMEOUT', 'Chrome did not answer a browser metadata request.',
-      'Call browser_status with reconnect: true. Keep Chrome foregrounded and the screen unlocked.');
-    const { targetInfos } = await withDeadline(async () => {
-      if (!this.cdp) this.cdp = await this.browser.newBrowserCDPSession();
-      this.assertActive();
-      return this.cdp.send('Target.getTargets');
-    }, 2000, metadataTimeout);
-    return Promise.all(live.map(async page => {
-      const id = this.register(page);
-      if (!this.targets.has(page)) {
-        let session;
-        let expired = false;
-        try {
-          const info = await withDeadline(async () => {
-            session = await page.context().newCDPSession(page);
-            try {
-              if (expired) throw metadataTimeout;
-              this.assertActive();
-              return await session.send('Target.getTargetInfo');
-            } finally { session.detach().catch(() => {}); }
-          }, 1500, metadataTimeout);
-          this.assertActive();
-          this.targets.set(page, info.targetInfo.targetId);
-        } catch { /* A closing target may not expose metadata yet. */ }
-        finally { expired = true; session?.detach().catch(() => {}); }
-      }
-      this.assertActive();
-      const info = targetInfos.find(target => target.targetId === this.targets.get(page));
-      const title = info?.title ?? this.titles.get(page) ?? '(loading)';
-      return { tab_id: id, url: page.url(), title: this.dialogs.has(page) ? '(dialog open)' : title, selected: this.selected === id };
-    }));
+    await this.syncPages();
+    return [...this.tabInfo].map(([id, info]) => ({ tab_id: id, url: info.url,
+      title: this.dialogs.has(this.pages.get(id)) ? '(dialog open)' : info.title || '(loading)', selected: this.selected === id }));
   }
 
-  async page(tabId) {
+  async page(tabId, { activate = false } = {}) {
     const live = await this.syncPages();
     const id = tabId || this.selected;
-    if (!id || !this.pages.has(id)) {
+    if (!id || !this.tabInfo.has(id)) {
       const tabs = live.length ? await this.tabs() : [];
       throw new ControlError(tabs.length ? 'TAB_SELECTION_REQUIRED' : 'NO_TABS',
         tabs.length ? 'Select a tab explicitly before controlling it.' : 'Chrome has no open web page targets.',
         tabs.length ? 'Call browser_tabs, then browser_select_tab with a tab_id. You can also pass tab_id to a tool.' : 'Open a tab in Chrome or call browser_new_tab.',
         { tabs });
     }
+    if (activate || !this.pages.has(id)) {
+      const targetId = this.tabInfo.get(id).targetId;
+      // Browser-level activation wakes Android's selected renderer before
+      // Playwright starts waiting for its Page/Runtime initialization replies.
+      await this.cdp.send('Target.activateTarget', { targetId });
+      this.assertActive();
+    }
+    if (!this.pages.has(id)) {
+      const targetId = this.tabInfo.get(id).targetId;
+      this.transport.attachTarget(targetId);
+      await withDeadline(async () => {
+        while (!this.pages.has(id)) {
+          this.assertActive();
+          await this.syncPages();
+          if (!this.tabInfo.has(id)) throw new ControlError('TAB_UNAVAILABLE', 'The selected tab closed before attachment.', 'Call browser_tabs and select an available tab.');
+          if (!this.pages.has(id)) await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      }, this.config.actionTimeout, new ControlError('SESSION_TIMEOUT', 'The selected tab did not initialize before the deadline.',
+        'Keep Chrome foregrounded and the screen unlocked, then reconnect and select the intended tab. Other tabs have not been closed.', { tab_id: id }));
+    }
     return { page: this.pages.get(id), id };
   }
 
   async selectTab(tabId) {
-    const { page, id } = await this.page(tabId);
+    const { page, id } = await this.page(tabId, { activate: true });
     await page.bringToFront();
     this.assertActive();
     this.selected = id;
@@ -255,6 +287,9 @@ export class BrowserController {
     // empty target before Playwright has a Page. Request the final URL first.
     const { targetId } = await this.cdp.send('Target.createTarget', { url });
     this.outcome.executed = true;
+    await this.cdp.send('Target.activateTarget', { targetId });
+    this.assertActive();
+    this.transport.attachTarget(targetId);
     const page = await withDeadline(async () => {
       while (true) {
         this.assertActive();

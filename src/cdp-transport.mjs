@@ -1,8 +1,8 @@
 import WebSocket from 'ws';
 
-// Android can expose a native Chrome UI target with an empty URL. Playwright
-// waits indefinitely for its first navigation during connectOverCDP. Leave that
-// target alone and attach when Chrome advertises an actual page URL instead.
+// Playwright initializes every page reported during connection. Android can
+// suspend background renderers, so hold their attachment events until the
+// controller selects a target. Discovery uses browser metadata, not renderers.
 export async function connectTransport(endpoint, { timeout, signal }) {
   const abort = new AbortController();
   const cancel = () => abort.abort(signal.reason);
@@ -47,8 +47,17 @@ function pageTransport(socket) {
   let nextId = 0;
   let discovering = false;
   const pending = new Map();
-  const excluded = new Map();
-  const excludedSessions = new Set();
+  const deferred = new Map();
+  const deferredSessions = new Set();
+  const allowed = new Set();
+  const publish = targetId => {
+    const event = deferred.get(targetId);
+    if (!event || !event.params.targetInfo.url || event.params.targetInfo.url === ':' || !allowed.has(targetId)) return false;
+    deferred.delete(targetId);
+    deferredSessions.delete(event.params.sessionId);
+    transport.onmessage?.(event);
+    return true;
+  };
   const transport = {
     send(message) {
       if (!message.sessionId && message.method === 'Target.setAutoAttach' && message.params.autoAttach && !discovering) {
@@ -56,6 +65,10 @@ function pageTransport(socket) {
         internal('Target.setDiscoverTargets', { discover: true });
       }
       socket.send(JSON.stringify(message));
+    },
+    attachTarget(targetId) {
+      allowed.add(targetId);
+      publish(targetId);
     },
     close() { socket.terminate(); },
   };
@@ -68,12 +81,6 @@ function pageTransport(socket) {
     timer.unref();
     pending.set(id, { timer, done });
     socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-  };
-  const attachReady = targetId => {
-    const target = excluded.get(targetId);
-    if (!target || target.detaching || target.attaching || !target.info.url || target.info.url === ':') return;
-    target.attaching = true;
-    internal('Target.attachToTarget', { targetId, flatten: true }, undefined, () => { target.attaching = false; });
   };
   socket.on('message', data => {
     let message;
@@ -90,40 +97,44 @@ function pageTransport(socket) {
     if (message.id < 0) return;
     if (!message.sessionId && message.method === 'Target.attachedToTarget') {
       const { targetInfo: info, sessionId, waitingForDebugger } = message.params;
-      if (info.type === 'page' && (!info.url || info.url === ':')) {
-        const target = { info, sessionId, detaching: true, attaching: false };
-        excluded.set(info.targetId, target);
-        excludedSessions.add(sessionId);
-        if (waitingForDebugger) internal('Runtime.runIfWaitingForDebugger', {}, sessionId);
-        internal('Target.detachFromTarget', { sessionId }, undefined, () => {
-          if (excluded.get(info.targetId) !== target) return;
-          target.detaching = false;
-          attachReady(info.targetId);
-        });
+      if (info.type === 'page') {
+        deferred.set(info.targetId, message);
+        deferredSessions.add(sessionId);
+        // Only new popups of an attached page inherit attachment. Existing
+        // background tabs with a historical opener remain deferred.
+        if (allowed.has(info.openerId)) allowed.add(info.targetId);
+        // Do not leave pages paused just because this client has not selected
+        // them. This command is fire-and-forget with a bounded callback.
+        if (!publish(info.targetId) && waitingForDebugger) internal('Runtime.runIfWaitingForDebugger', {}, sessionId);
         return;
       }
-      excluded.delete(info.targetId);
     }
     if (!message.sessionId && message.method === 'Target.targetInfoChanged') {
       const info = message.params.targetInfo;
-      const target = excluded.get(info.targetId);
-      if (target) { target.info = info; attachReady(info.targetId); }
+      const event = deferred.get(info.targetId);
+      if (event) { event.params.targetInfo = info; publish(info.targetId); }
     }
     if (!message.sessionId && message.method === 'Target.targetDestroyed') {
-      const target = excluded.get(message.params.targetId);
-      if (target) excludedSessions.delete(target.sessionId);
-      excluded.delete(message.params.targetId);
+      const targetId = message.params.targetId;
+      const event = deferred.get(targetId);
+      if (event) deferredSessions.delete(event.params.sessionId);
+      deferred.delete(targetId);
+      allowed.delete(targetId);
     }
-    if (!message.sessionId && message.method === 'Target.detachedFromTarget' && excludedSessions.delete(message.params.sessionId)) return;
-    if (excludedSessions.has(message.sessionId)) return;
+    if (!message.sessionId && message.method === 'Target.detachedFromTarget' && deferredSessions.delete(message.params.sessionId)) {
+      deferred.delete(message.params.targetId);
+      return;
+    }
+    if (deferredSessions.has(message.sessionId)) return;
     transport.onmessage?.(message);
   });
   socket.on('error', () => socket.terminate());
   socket.on('close', (_code, reason) => {
     for (const request of pending.values()) clearTimeout(request.timer);
     pending.clear();
-    excluded.clear();
-    excludedSessions.clear();
+    deferred.clear();
+    deferredSessions.clear();
+    allowed.clear();
     transport.onclose?.(reason.toString());
   });
   return transport;

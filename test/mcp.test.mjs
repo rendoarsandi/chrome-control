@@ -100,6 +100,7 @@ test('MCP connects around an empty Chrome target and discovers it after navigati
         const message = JSON.parse(data.toString());
         if (message.method === 'Target.attachedToTarget' && message.params.targetInfo.type === 'page' && message.params.targetInfo.url === 'about:blank') blankSessions.add(message.params.sessionId);
         empty(message.params?.targetInfo);
+        for (const info of message.result?.targetInfos || []) empty(info);
         if (frameTrees.delete(message.id) && message.result?.frameTree.frame.url === 'about:blank') message.result.frameTree.frame.url = '';
         downstream.send(JSON.stringify(message));
       });
@@ -142,6 +143,63 @@ test('MCP connects around an empty Chrome target and discovers it after navigati
     await new Promise(resolve => pageSite.close(resolve));
     await observer?.close();
     await fixture.close();
+  }
+});
+
+test('MCP discovers suspended tabs without contacting their renderers', { timeout: 15000 }, async () => {
+  const relay = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(resolve => relay.once('listening', resolve));
+  const targets = [
+    { targetId: 'ready', type: 'page', title: 'Ready', url: 'https://ready.example/', browserContextId: 'default' },
+    { targetId: 'suspended', type: 'page', title: 'Suspended', url: 'https://suspended.example/', browserContextId: 'default' },
+    { targetId: 'native', type: 'page', title: '', url: '', browserContextId: 'default' },
+  ];
+  const rendererCommands = [];
+  const closedTargets = [];
+  relay.on('connection', socket => {
+    socket.on('message', data => {
+      const message = JSON.parse(data.toString());
+      // Browser metadata is responsive; every page renderer is suspended. This
+      // is a CDP peer, not a mock of BrowserController or its attachment logic.
+      if (targets.some(target => message.sessionId === target.targetId)) {
+        if (message.method !== 'Runtime.runIfWaitingForDebugger') rendererCommands.push(message.method);
+        return;
+      }
+      let result = {};
+      if (message.method === 'Browser.getVersion') result = {
+        product: 'Chrome/152.0.0.0', revision: 'fixture', protocolVersion: '1.3', userAgent: 'Chrome', jsVersion: '1',
+      };
+      if (message.method === 'Target.setAutoAttach' && message.params.autoAttach) {
+        for (const targetInfo of targets) socket.send(JSON.stringify({ method: 'Target.attachedToTarget',
+          params: { targetInfo, sessionId: targetInfo.targetId, waitingForDebugger: true } }));
+      }
+      if (message.method === 'Target.getTargetInfo') result = { targetInfo: { targetId: 'browser', type: 'browser', url: '' } };
+      if (message.method === 'Target.attachToBrowserTarget') result = { sessionId: 'browser-metadata' };
+      if (message.method === 'Target.getTargets') result = { targetInfos: targets };
+      if (message.method === 'Target.closeTarget') closedTargets.push(message.params.targetId);
+      socket.send(JSON.stringify({ id: message.id, result, ...(message.sessionId ? { sessionId: message.sessionId } : {}) }));
+    });
+  });
+  const session = await clientFor({ CHROME_CDP_URL: `ws://127.0.0.1:${relay.address().port}`, CHROME_AUTO_ADB: '0' });
+  try {
+    const status = (await session.call('browser_status')).data;
+    assert.equal(status.ok, true, JSON.stringify(status));
+    assert.deepEqual(status.tabs.map(tab => tab.title).sort(), ['Ready', 'Suspended']);
+    assert(status.tabs.every(tab => !tab.selected), 'Multiple tabs require explicit selection');
+    const unselected = (await session.call('browser_snapshot')).data;
+    assert.equal(unselected.error.code, 'TAB_SELECTION_REQUIRED');
+    const rediscovered = (await session.call('browser_tabs')).data;
+    assert.deepEqual(rediscovered.tabs, status.tabs, 'Tab IDs remain stable without renderer reads');
+    const reconnected = (await session.call('browser_status', { reconnect: true })).data;
+    assert.equal(reconnected.ok, true, JSON.stringify(reconnected));
+    assert.equal(reconnected.tabs.length, 2);
+    assert.deepEqual(rendererCommands, [], 'Discovery must not initialize suspended renderers');
+    assert.deepEqual(closedTargets, [], 'Discovery and reconnect must preserve tabs');
+    assert.equal(session.stderr(), '');
+  } finally {
+    await session.client.close();
+    for (const socket of relay.clients) socket.terminate();
+    await new Promise(resolve => relay.close(resolve));
   }
 });
 
