@@ -1,17 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import WebSocket, { WebSocketServer } from 'ws';
 import { forwardChrome } from '../src/adb.mjs';
 import { readConfig } from '../src/config.mjs';
 import { withDeadline } from '../src/errors.mjs';
+import { createServer } from '../src/server.mjs';
 
 const entry = fileURLToPath(new URL('../bin/chrome-control-mcp.mjs', import.meta.url));
 
@@ -207,8 +210,12 @@ test('MCP discovers tools without Chrome or API keys and gives actionable connec
   const session = await clientFor({ CHROME_CDP_URL: 'http://127.0.0.1:1', CHROME_AUTO_ADB: '0', GEMINI_API_KEY: '', OPENAI_API_KEY: '', ANTHROPIC_API_KEY: '' });
   try {
     const { tools } = await session.client.listTools();
-    assert(tools.some(tool => tool.name === 'browser_snapshot'));
+    assert(tools.some(tool => tool.name === 'browser_snapshot' && tool.inputSchema.properties.mode));
     assert(tools.some(tool => tool.name === 'browser_click' && tool.inputSchema.required.includes('ref')));
+    assert(tools.some(tool => tool.name === 'browser_console_messages'));
+    assert(tools.some(tool => tool.name === 'browser_network_requests'));
+    assert(tools.some(tool => tool.name === 'browser_route'));
+    assert(tools.some(tool => tool.name === 'browser_pdf'));
     const { response, data } = await session.call('browser_status');
     assert.equal(response.isError, true);
     assert.equal(data.error.code, 'CDP_UNAVAILABLE');
@@ -333,6 +340,206 @@ test('ADB passes configuration as arguments, validates timeouts, and bounds requ
   assert.equal(adbStarted, false);
   assert.throws(() => readConfig({ CHROME_ACTION_TIMEOUT_MS: 'NaN' }));
   await assert.rejects(withDeadline(() => new Promise(() => {}), 20), error => error.code === 'REQUEST_TIMEOUT');
+});
+
+test('console, network, route, pdf, and aria snapshot tools work end-to-end', async () => {
+  const relay = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(resolve => relay.once('listening', resolve));
+  const tempDir = await mkdtemp(join(tmpdir(), 'chrome-control-pdf-'));
+  let app;
+  let client;
+  try {
+    const targetInfo = { targetId: 'mock-tab-1', type: 'page', title: 'Mock Page', url: 'https://mock.test/' };
+    const activeRoutes = [];
+    let eventSession;
+    let pdfUnsupported = false;
+    let connected = true;
+    const makeHandle = value => ({
+      getProperty: async key => {
+        if (key === 'data') return { jsonValue: async () => value, dispose: async () => {} };
+        if (key === 'nodes') return { evaluate: async () => value.stamp, dispose: async () => {} };
+        return { dispose: async () => {} };
+      },
+      dispose: async () => {},
+    });
+    const mainFrame = {
+      url: () => targetInfo.url,
+      name: () => '',
+      isDetached: () => false,
+      evaluateHandle: async () => makeHandle({
+        stamp: 'stamp-1',
+        title: targetInfo.title,
+        text: 'Hello Mock',
+        text_truncated: false,
+        elements: [{ index: 0, tag: 'button', role: 'button', name: 'Submit', disabled: false, in_viewport: true }],
+        elements_truncated: false,
+      }),
+    };
+    const page = Object.assign(new EventEmitter(), {
+      isClosed: () => false,
+      context: () => context,
+      url: () => targetInfo.url,
+      title: async () => targetInfo.title,
+      frames: () => [mainFrame],
+      mainFrame: () => mainFrame,
+      ariaSnapshot: async () => '- document:\n  - heading "Hello Mock" [level=1]\n  - button "Submit"',
+      route: async (pattern, handler) => { activeRoutes.push({ pattern, handler }); },
+      unroute: async (pattern, handler) => {
+        for (let i = activeRoutes.length - 1; i >= 0; i--) {
+          if (activeRoutes[i].pattern === pattern && (!handler || activeRoutes[i].handler === handler)) activeRoutes.splice(i, 1);
+        }
+      },
+    });
+    const context = {
+      setDefaultTimeout: () => {},
+      pages: () => [page],
+      newCDPSession: async () => {
+        const session = Object.assign(new EventEmitter(), {
+          send: async method => {
+            if (method === 'Target.getTargetInfo') return { targetInfo };
+            if (method === 'Network.enable') { eventSession = session; return {}; }
+            if (method === 'Runtime.enable' || method === 'Page.enable') return {};
+            if (method === 'Page.printToPDF') {
+              if (pdfUnsupported) throw new Error('PrintToPDF is not implemented');
+              return { data: Buffer.from('%PDF-1.4 mock').toString('base64') };
+            }
+            return {};
+          },
+          detach: async () => {},
+        });
+        return session;
+      },
+    };
+    const fakeChromium = {
+      connectOverCDP: async transport => {
+        transport.onclose = () => { connected = false; };
+        return {
+          isConnected: () => connected,
+          contexts: () => [context],
+          newBrowserCDPSession: async () => ({
+            send: async method => (method === 'Target.getTargets' ? { targetInfos: [targetInfo] } : {}),
+            detach: async () => {},
+          }),
+          close: async () => { connected = false; transport.close(); },
+        };
+      },
+    };
+    app = createServer(fakeChromium, readConfig({
+      CHROME_CDP_URL: `ws://127.0.0.1:${relay.address().port}`,
+      CHROME_AUTO_ADB: '0',
+    }));
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    client = new Client({ name: 'chrome-control-feature-tests', version: '1.0.0' });
+    await Promise.all([app.server.connect(serverTransport), client.connect(clientTransport)]);
+    const call = async (name, args = {}) => {
+      const response = await client.callTool({ name, arguments: args });
+      return { response, data: JSON.parse(response.content.find(item => item.type === 'text').text) };
+    };
+
+    const ariaSnap = await call('browser_snapshot', { mode: 'aria' });
+    assert.equal(ariaSnap.data.ok, true, JSON.stringify(ariaSnap.data));
+    assert.equal(ariaSnap.data.mode, 'aria');
+    assert.match(ariaSnap.data.aria_tree, /button "Submit"/);
+    assert.deepEqual(ariaSnap.data.elements, []);
+
+    const bothSnap = await call('browser_snapshot', { mode: 'both' });
+    assert.equal(bothSnap.data.ok, true);
+    assert.equal(bothSnap.data.mode, 'both');
+    assert.equal(bothSnap.data.elements.length, 1);
+    assert.match(bothSnap.data.aria_tree, /heading "Hello Mock"/);
+
+    const watchConsole = await call('browser_console_messages', { action: 'watch' });
+    assert.equal(watchConsole.data.watching, true);
+    assert.equal(watchConsole.data.newly_started, true);
+    eventSession.emit('Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'Console line' }] });
+    eventSession.emit('Runtime.exceptionThrown', { exceptionDetails: { text: 'Uncaught Boom' } });
+
+    const onlyConsole = await call('browser_console_messages', { action: 'drain', include_exceptions: false });
+    assert.equal(onlyConsole.data.events.length, 1);
+    assert.equal(onlyConsole.data.events[0].text, 'Console line');
+    assert.equal(onlyConsole.data.remaining, 1);
+    const drainedException = await call('browser_console_messages', { action: 'drain' });
+    assert.equal(drainedException.data.events.length, 1);
+    assert.equal(drainedException.data.events[0].type, 'exception');
+
+    const watchNet = await call('browser_network_requests', { action: 'watch' });
+    assert.equal(watchNet.data.newly_started, false);
+    eventSession.emit('Network.requestWillBeSent', { requestId: 'r1', type: 'Fetch', request: { url: 'https://mock.test/api', method: 'GET' } });
+    eventSession.emit('Network.responseReceived', { requestId: 'r1', response: { url: 'https://mock.test/api', status: 200, mimeType: 'application/json' } });
+    eventSession.emit('Network.loadingFinished', { requestId: 'r1' });
+    const netIdle = await call('browser_network_requests', { action: 'idle', idle_ms: 100, timeout_ms: 1000 });
+    assert.equal(netIdle.data.idle.matched, true);
+    assert.equal(netIdle.data.events.length, 3);
+
+    const missingPattern = await call('browser_route', { operation: 'add' });
+    assert.equal(missingPattern.response.isError, true);
+    assert.equal(missingPattern.data.error.code, 'ROUTE_PATTERN_REQUIRED');
+
+    const addedFulfill = await call('browser_route', {
+      operation: 'add', pattern: '**/api/*', route_action: 'fulfill',
+      status: 201, body: '{"mock":true}', content_type: 'application/json', headers: { 'x-mock': '1' },
+    });
+    assert.equal(addedFulfill.data.added, '**/api/*');
+    await call('browser_route', { operation: 'add', pattern: '**/pass/*', route_action: 'continue', headers: { 'x-extra': 'yes' } });
+    await call('browser_route', { operation: 'add', pattern: '**/block/*', route_action: 'abort', error_code: 'accessdenied' });
+    const listedRoutes = await call('browser_route', { operation: 'list' });
+    assert.equal(listedRoutes.data.routes.length, 3);
+    assert.equal(activeRoutes.length, 3);
+
+    const fulfilled = [];
+    await activeRoutes[0].handler({ fulfill: async payload => fulfilled.push(payload) });
+    assert.deepEqual(fulfilled[0], { status: 201, contentType: 'application/json', body: '{"mock":true}', headers: { 'x-mock': '1' } });
+    const continued = [];
+    await activeRoutes[1].handler({ request: () => ({ headers: () => ({ accept: '*/*' }) }), continue: async payload => continued.push(payload) });
+    assert.deepEqual(continued[0], { headers: { accept: '*/*', 'x-extra': 'yes' } });
+    const aborted = [];
+    await activeRoutes[2].handler({ abort: async code => aborted.push(code) });
+    assert.deepEqual(aborted, ['accessdenied']);
+
+    const removedOne = await call('browser_route', { operation: 'remove', pattern: '**/pass/*' });
+    assert.equal(removedOne.data.removed, 1);
+    assert.equal(removedOne.data.routes.length, 2);
+    const removedAll = await call('browser_route', { operation: 'remove' });
+    assert.equal(removedAll.data.removed, 2);
+    assert.equal(activeRoutes.length, 0);
+
+    const relPdf = await call('browser_pdf', { path: 'relative.pdf' });
+    assert.equal(relPdf.response.isError, true);
+    assert.equal(relPdf.data.error.code, 'PDF_PATH_INVALID');
+
+    const memPdf = await call('browser_pdf', {});
+    assert.equal(Buffer.from(memPdf.data.data_base64, 'base64').toString(), '%PDF-1.4 mock');
+
+    const pdfPath = join(tempDir, 'page.pdf');
+    const savedPdf = await call('browser_pdf', { path: pdfPath, landscape: true });
+    assert.equal(savedPdf.data.path, pdfPath);
+    assert.equal(await readFile(pdfPath, 'utf8'), '%PDF-1.4 mock');
+
+    pdfUnsupported = true;
+    const unsupportedPdf = await call('browser_pdf', {});
+    assert.equal(unsupportedPdf.response.isError, true);
+    assert.equal(unsupportedPdf.data.error.code, 'PDF_UNSUPPORTED');
+    pdfUnsupported = false;
+
+    const execResult = await call('browser_exec', {
+      include_snapshot: false,
+      code: [
+        'await route("**/exec/*", { body: "exec-mock" });',
+        'var routesBefore = (await route({ operation: "list" })).routes.length;',
+        'await route({ operation: "remove" });',
+        'var doc = await pdf();',
+        '({ routesBefore, bytes: doc.bytes });',
+      ].join('\n'),
+    });
+    assert.equal(execResult.data.ok, true, JSON.stringify(execResult.data));
+    assert.deepEqual(execResult.data.result, { routesBefore: 1, bytes: 13 });
+  } finally {
+    await client?.close();
+    await app?.close();
+    for (const socket of relay.clients) socket.terminate();
+    await new Promise(resolve => relay.close(resolve));
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('real browser MCP actions, frames, shadow DOM, tab safety and reference lifetime', { timeout: 120000 }, async t => {
@@ -781,6 +988,25 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     await invoke('browser_select_tab', { tab_id: recoveredTab.tab_id });
     const executedOnce = await invoke('browser_evaluate', { expression: 'window.clicks' });
     assert.equal(executedOnce.result, 1, 'Exec timeout recovery must never replay completed input');
+    const aria = await invoke('browser_snapshot', { mode: 'aria' });
+    assert.equal(aria.mode, 'aria');
+    assert(aria.aria_tree.includes('heading') || aria.aria_tree.includes('button'));
+    const both = await invoke('browser_snapshot', { mode: 'both' });
+    assert.equal(both.mode, 'both');
+    assert(both.elements.length > 0 && both.aria_tree.length > 0);
+    await invoke('browser_console_messages', { action: 'watch' });
+    await invoke('browser_evaluate', { expression: 'console.log("Top-level console check");' });
+    const consoleOut = await invoke('browser_console_messages', { action: 'drain' });
+    assert(consoleOut.events.some(event => event.type === 'console' && event.text === 'Top-level console check'));
+    await invoke('browser_route', { operation: 'add', pattern: '**/mocked.json', status: 200, content_type: 'application/json', body: '{"routed":true}' });
+    const fetched = await invoke('browser_evaluate', { expression: 'fetch("/mocked.json").then(r => r.json())' });
+    assert.deepEqual(fetched.result, { routed: true });
+    const netOut = await invoke('browser_network_requests', { action: 'drain' });
+    assert(netOut.events.some(event => event.url.includes('/mocked.json')));
+    await invoke('browser_route', { operation: 'remove' });
+    const pdfPath = join(uploadDir, 'real.pdf');
+    const pdfRes = await invoke('browser_pdf', { path: pdfPath });
+    assert(pdfRes.bytes > 0);
     assert.equal(session.stderr(), '');
   } finally {
     await frameObserver?.close();

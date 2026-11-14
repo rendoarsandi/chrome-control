@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, extname, isAbsolute } from 'node:path';
 import { canForward, forwardChrome } from './adb.mjs';
 import { connectTransport } from './cdp-transport.mjs';
@@ -43,6 +43,7 @@ export class BrowserController {
     this.snapshotFrames = [];
     this.snapshotCount = 0;
     this.eventStreams = new Map();
+    this.routes = new Map();
   }
 
   assertActive() {
@@ -73,6 +74,7 @@ export class BrowserController {
     this.selected = null;
     for (const stream of this.eventStreams.values()) stream.close();
     this.eventStreams.clear();
+    this.routes.clear();
     for (const session of this.execSessions.values()) session.detach().catch(() => {});
     this.execSessions.clear();
     const open = async timeout => {
@@ -162,6 +164,7 @@ export class BrowserController {
     this.selected = null;
     for (const stream of this.eventStreams.values()) stream.close();
     this.eventStreams.clear();
+    this.routes.clear();
     for (const session of this.execSessions.values()) session.detach().catch(() => {});
     this.execSessions.clear();
     await withDeadline(() => browser?.close(), 1000).catch(() => {});
@@ -178,6 +181,7 @@ export class BrowserController {
     page.on('close', () => {
       this.dialogs.delete(page); this.fileChoosers.delete(page);
       this.eventStreams.get(page)?.close(); this.eventStreams.delete(page);
+      this.routes.delete(page);
     });
     page.on('framedetached', frame => {
       this.execSessions.get(frame)?.detach().catch(() => {});
@@ -349,12 +353,31 @@ export class BrowserController {
     }
   }
 
-  async snapshot({ tab_id, max_elements = 160, max_text = 12000 } = {}) {
+  async snapshot({ tab_id, max_elements = 160, max_text = 12000, mode = 'dom' } = {}) {
     const { page, id } = await this.page(tab_id);
     this.snapshotCount++;
     if (this.dialogs.has(page)) {
       await this.clearRefs();
       return this.lastSnapshot = { tab_id: id, url: page.url(), dialog: this.dialogInfo(page), frames: [], elements: [], recovery: 'Call browser_handle_dialog to accept or dismiss this dialog before interacting with the page.' };
+    }
+    if (mode === 'aria') {
+      await this.clearRefs();
+      const snapshotId = `snapshot_${this.prefix}_${++this.sequence}`;
+      const rawAria = await withDeadline(
+        () => page.ariaSnapshot({ timeout: Math.min(this.config.actionTimeout, 5000) }),
+        Math.min(this.config.actionTimeout, this.config.requestTimeout - 1000),
+        new ControlError('SNAPSHOT_TIMEOUT', 'The selected tab did not answer the accessibility snapshot request.',
+          'Call browser_status with reconnect: true, then select the intended tab.', { tab_id: id }),
+      );
+      this.assertActive();
+      const title = await page.title().catch(() => this.titles.get(page) || '(loading)');
+      this.titles.set(page, title);
+      return {
+        tab_id: id, snapshot_id: snapshotId, mode: 'aria', url: page.url(), title,
+        aria_tree: rawAria.slice(0, max_text),
+        ...(rawAria.length > max_text ? { aria_truncated: true } : {}),
+        frames: [], elements: [],
+      };
     }
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.clearRefs();
@@ -410,9 +433,24 @@ export class BrowserController {
         continue;
       }
       if (pageFrames.length > 25) warnings.push({ message: 'Only the first 25 frames were inspected.' });
+      let ariaFields = {};
+      if (mode === 'both') {
+        try {
+          const rawAria = await withDeadline(
+            () => page.ariaSnapshot({ timeout: Math.min(this.config.actionTimeout, 3000) }),
+            Math.min(this.config.actionTimeout, 3000),
+          );
+          ariaFields = {
+            aria_tree: rawAria.slice(0, max_text),
+            ...(rawAria.length > max_text ? { aria_truncated: true } : {}),
+          };
+        } catch (error) {
+          warnings.push({ message: `Accessibility tree unavailable: ${error.message}` });
+        }
+      }
       return this.lastSnapshot = {
-        tab_id: id, snapshot_id: snapshotId, url: page.url(), title,
-        frames, elements, ...(warnings.length ? { warnings } : {}),
+        tab_id: id, snapshot_id: snapshotId, ...(mode === 'both' ? { mode } : {}), url: page.url(), title,
+        frames, elements, ...ariaFields, ...(warnings.length ? { warnings } : {}),
         reference_help: 'Use ref values from this snapshot. A new snapshot or action invalidates earlier references. Offscreen elements are scrolled into view during interaction.',
       };
     }
@@ -443,7 +481,8 @@ export class BrowserController {
 
   async events(tabId) {
     const { page, id } = await this.page(tabId);
-    if (!this.eventStreams.has(page)) {
+    const wasWatching = this.eventStreams.has(page);
+    if (!wasWatching) {
       const session = await page.context().newCDPSession(page);
       if (this.stopped) { session.detach().catch(() => {}); this.assertActive(); }
       const stream = new PageEvents(session);
@@ -451,7 +490,95 @@ export class BrowserController {
       try { await stream.start(); this.assertActive(); }
       catch (error) { stream.close(); this.eventStreams.delete(page); throw error; }
     }
-    return { id, stream: this.eventStreams.get(page) };
+    return { id, stream: this.eventStreams.get(page), newly_started: !wasWatching };
+  }
+
+  async route({ tab_id, operation = 'add', pattern, route_action = 'fulfill', status = 200, body = '', content_type = 'text/plain', headers = {}, error_code = 'failed' } = {}) {
+    const { page, id } = await this.page(tab_id);
+    const entries = this.routes.get(page) || [];
+    const serialize = list => list.map(({ handler: _handler, ...meta }) => meta);
+    if (operation === 'list') return { tab_id: id, routes: serialize(entries) };
+    if (operation === 'remove') {
+      const removed = [];
+      const remaining = [];
+      for (const entry of entries) {
+        if (!pattern || entry.pattern === pattern) removed.push(entry);
+        else remaining.push(entry);
+      }
+      if (removed.length) this.noteInput('route', id);
+      for (const entry of removed) await page.unroute(entry.pattern, entry.handler);
+      if (removed.length) this.outcome.executed = true;
+      if (remaining.length) this.routes.set(page, remaining);
+      else this.routes.delete(page);
+      return { tab_id: id, removed: removed.length, routes: serialize(remaining) };
+    }
+    if (!pattern) {
+      throw new ControlError('ROUTE_PATTERN_REQUIRED', 'A URL pattern is required to add a route.',
+        'Provide a glob pattern such as "**/api/*" or "*://example.com/*".');
+    }
+    if (entries.length >= 50) {
+      throw new ControlError('ROUTE_LIMIT', 'At most 50 active routes are supported per tab.',
+        'Remove unused routes with operation: "remove".');
+    }
+    const handler = async route => {
+      try {
+        if (route_action === 'abort') await route.abort(error_code);
+        else if (route_action === 'continue') await route.continue({ headers: { ...route.request().headers(), ...headers } });
+        else await route.fulfill({ status, contentType: content_type, body, headers });
+      } catch {}
+    };
+    this.noteInput('route', id);
+    await page.route(pattern, handler);
+    this.outcome.executed = true;
+    const entry = {
+      pattern, route_action,
+      ...(route_action === 'fulfill' ? { status, content_type, body_bytes: Buffer.byteLength(body) } : {}),
+      ...(route_action === 'abort' ? { error_code } : {}),
+      ...(Object.keys(headers).length ? { headers } : {}),
+      handler,
+    };
+    const updated = [...entries, entry];
+    this.routes.set(page, updated);
+    return { tab_id: id, added: pattern, routes: serialize(updated) };
+  }
+
+  async pdf({ tab_id, path, landscape = false, print_background = true, scale = 1, prefer_css_page_size = false } = {}) {
+    const { page, id } = await this.page(tab_id);
+    if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is open in this tab.', 'Read browser_snapshot, then call browser_handle_dialog.', { dialog: this.dialogInfo(page) });
+    if (path !== undefined && !isAbsolute(path)) {
+      throw new ControlError('PDF_PATH_INVALID', 'PDF output path must be an absolute local path.',
+        'Use the full path on the machine running the MCP server.');
+    }
+    let session;
+    try {
+      session = await page.context().newCDPSession(page);
+      this.assertActive();
+      let data;
+      try {
+        ({ data } = await withDeadline(() => session.send('Page.printToPDF', {
+          landscape, printBackground: print_background, scale, preferCSSPageSize: prefer_css_page_size,
+        }), this.config.actionTimeout));
+      } catch (error) {
+        if (/PrintToPDF is not implemented|printing is not available/i.test(error.message)) {
+          throw new ControlError('PDF_UNSUPPORTED', 'This Chrome build does not support CDP Page.printToPDF.',
+            'Use browser_screenshot with full: true on Android Chrome builds that disable headless PDF printing.');
+        }
+        throw error;
+      }
+      this.assertActive();
+      const buffer = Buffer.from(data, 'base64');
+      if (path) {
+        await writeFile(path, buffer);
+        return { tab_id: id, url: page.url(), path, bytes: buffer.length };
+      }
+      if (buffer.length > 10 * 1024 * 1024) {
+        throw new ControlError('PDF_SIZE_LIMIT', 'Generated PDF exceeds 10 MiB.',
+          'Pass an absolute path to save large PDFs to disk.');
+      }
+      return { tab_id: id, url: page.url(), bytes: buffer.length, data_base64: data };
+    } finally {
+      session?.detach().catch(() => {});
+    }
   }
 
   async target(ref, page) {

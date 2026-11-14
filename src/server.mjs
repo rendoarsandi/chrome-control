@@ -114,8 +114,9 @@ export function createServer(chromium, config) {
     async (browser, args) => result(await browser.closeTab(args.tab_id)), true);
   register('browser_handle_dialog', 'Accept or dismiss a pending JavaScript alert, confirm or prompt shown in the snapshot. Supply prompt_text when accepting a prompt. Returns a fresh snapshot.', { tab_id: tab, accept: z.boolean(), prompt_text: z.string().max(10000).optional() }, false,
     async (browser, args) => result(await browser.handleDialog(args)), true);
-  register('browser_snapshot', 'Read page text and interactive elements, including iframes and open shadow roots. Returns fresh element refs, names, roles, input values (excluding passwords), checked state and select options. Replaces prior refs. Increase limits if truncated.', {
+  register('browser_snapshot', 'Read page text and interactive elements, including iframes and open shadow roots, or capture Playwright\'s accessibility tree YAML snapshot. mode: "dom" (default) returns fresh element refs, names, roles, input values (excluding passwords), checked state and select options; "aria" returns the accessibility tree; "both" returns both. Replaces prior refs. Increase limits if truncated.', {
     tab_id: tab, max_elements: z.number().int().min(1).max(500).default(160), max_text: z.number().int().min(100).max(50000).default(12000),
+    mode: z.enum(['dom', 'aria', 'both']).default('dom').describe('dom (default) collects interactive DOM elements with actionable refs; aria returns Playwright\'s accessibility tree YAML snapshot; both returns DOM elements/refs and the accessibility tree.'),
   }, true, async (browser, args) => result(await browser.snapshot(args)));
   const action = (name, description, schema, destructive = false) => register(`browser_${name}`, `${description} Returns a fresh snapshot; inspect it to verify the outcome. Use wait_for for asynchronous results.`, { tab_id: tab, ...schema, ...observeSchema }, false,
     async (browser, args) => observedResult(browser, args, await browser.action(name, args)), destructive);
@@ -149,6 +150,49 @@ export function createServer(chromium, config) {
     });
   register('browser_evaluate', 'Evaluate JavaScript in the main frame, or a current snapshot frame_id, for gaps in ordinary tools. Can modify the page; returns its result and a fresh snapshot.', { tab_id: tab, frame_id: z.string().regex(/^frame_\d+$/).optional(), expression: z.string().min(1).max(20000), snapshot: observeSchema.snapshot }, false,
     async (browser, args) => result(await browser.evaluate(args)), true);
+  register('browser_console_messages', 'Watch or drain console messages and uncaught page exceptions from the selected tab. Call with action: "watch" before triggering page activity, or "drain" to read queued console/exception events.', {
+    tab_id: tab,
+    action: z.enum(['watch', 'drain']).default('drain'),
+    include_exceptions: z.boolean().default(true),
+    max_events: z.number().int().min(1).max(256).default(100),
+  }, true, async (browser, args) => {
+    const { id, stream, newly_started } = await browser.events(args.tab_id);
+    if (args.action === 'watch') return result({ tab_id: id, watching: true, newly_started, scope: 'selected_page' });
+    const types = args.include_exceptions ? ['console', 'exception'] : ['console'];
+    return result({ tab_id: id, watching: true, newly_started, ...stream.drain({ types, max_events: args.max_events }) });
+  });
+  register('browser_network_requests', 'Watch, drain, or wait for network idle on the selected tab. Call with action: "watch" before triggering requests, "drain" to read queued network events, or "idle" to wait for in-flight requests to finish.', {
+    tab_id: tab,
+    action: z.enum(['watch', 'drain', 'idle']).default('drain'),
+    types: z.array(z.enum(['request', 'response', 'finished', 'failed'])).min(1).max(4).default(['request', 'response', 'finished', 'failed']),
+    max_events: z.number().int().min(1).max(256).default(100),
+    idle_ms: z.number().int().min(100).max(2000).default(500),
+    timeout_ms: z.number().int().min(1).max(5000).default(5000),
+  }, true, async (browser, args) => {
+    const { id, stream, newly_started } = await browser.events(args.tab_id);
+    if (args.action === 'watch') return result({ tab_id: id, watching: true, newly_started, scope: 'selected_page' });
+    const idle = args.action === 'idle' ? await stream.idle({ idle_ms: args.idle_ms, timeout_ms: args.timeout_ms }) : undefined;
+    return result({ tab_id: id, watching: true, newly_started, ...(idle ? { idle } : {}), ...stream.drain({ types: args.types, max_events: args.max_events }) });
+  });
+  register('browser_route', 'Add, list, or remove network request routes and mocks on the selected tab. Supports fulfilling requests with custom status/body/headers, continuing with modified headers, or aborting requests.', {
+    tab_id: tab,
+    operation: z.enum(['add', 'list', 'remove']).default('add'),
+    pattern: z.string().min(1).max(2000).optional().describe('URL glob pattern (e.g. "**/api/*", "**/*.png"). Required for add; omit in remove to clear all routes on the tab.'),
+    route_action: z.enum(['fulfill', 'continue', 'abort']).default('fulfill'),
+    status: z.number().int().min(100).max(599).default(200),
+    body: z.string().max(500000).default(''),
+    content_type: z.string().min(1).max(200).default('text/plain'),
+    headers: z.record(z.string().max(4000)).default({}),
+    error_code: z.enum(['aborted', 'accessdenied', 'addressunreachable', 'blockedbyclient', 'blockedbyresponse', 'connectionaborted', 'connectionclosed', 'connectionfailed', 'connectionrefused', 'connectionreset', 'internetdisconnected', 'namenotresolved', 'timedout', 'failed']).default('failed'),
+  }, false, async (browser, args) => result(await browser.route(args)));
+  register('browser_pdf', 'Export the selected tab as a PDF via CDP Page.printToPDF. Supply an absolute path to save to disk, or omit path to receive base64 PDF data.', {
+    tab_id: tab,
+    path: z.string().min(1).max(4096).optional().describe('Optional absolute local file path to save the PDF.'),
+    landscape: z.boolean().default(false),
+    print_background: z.boolean().default(true),
+    scale: z.number().min(0.1).max(2).default(1),
+    prefer_css_page_size: z.boolean().default(false),
+  }, true, async (browser, args) => result(await browser.pdf(args)));
   const aliases = {
     list_tabs: ['browser_tabs', () => ({})],
     select_tab: ['browser_select_tab', tab_id => ({ tab_id })],
@@ -168,6 +212,10 @@ export function createServer(chromium, config) {
     upload: ['browser_upload', (paths, ref, options = {}) => ({ ...options, paths, ref })],
     batch: ['browser_batch', (actions, options = {}) => ({ ...options, actions })],
     handle_dialog: ['browser_handle_dialog', (accept, prompt_text, options = {}) => ({ ...options, accept, prompt_text })],
+    console_messages: ['browser_console_messages', (options = {}) => options],
+    network_requests: ['browser_network_requests', (options = {}) => options],
+    route: ['browser_route', (pattern, options = {}) => (typeof pattern === 'object' ? pattern : { ...options, pattern })],
+    pdf: ['browser_pdf', (options = {}) => (typeof options === 'string' ? { path: options } : options)],
   };
   const cdpSchema = z.object({ tab_id: tab, frame_id: z.string().regex(/^frame_\d+$/).optional(),
     method: z.string().regex(/^[A-Za-z]+\.[A-Za-z]+$/), params: z.record(z.unknown()).default({}) });
@@ -175,7 +223,7 @@ export function createServer(chromium, config) {
     ...[...operations.keys()].filter(name => name !== 'browser_status'),
     ...Object.keys(aliases), 'cdp', 'type_text', 'wait_for_load', 'watch_events', 'drain_events', 'wait_for_network_idle',
   ]);
-  register('browser_exec', 'Persistent JavaScript with top-level await, variables/functions, loops and conditions. Await helpers: list_tabs(), select_tab(id), new_tab(url), close_tab(id), goto_url(url,options), page_info(options), click(ref,options), fill(ref,text,options), select(ref,values,options), press(key,ref,options), scroll(options), click_at_xy(x,y,options), type_text(text), js(expression,options), cdp(method,params,options), wait_for_load(state), wait_for(condition,options), wait_for_element(selector,{state,frame_id,timeout_ms}), upload(paths,ref,options), batch(actions,options), handle_dialog(accept,prompt,options), watch_events(), drain_events(options), wait_for_network_idle(options), sleep(ms), print(...). Ordinary browser_* tools are callable with argument objects except browser_status/browser_exec. page_info() returns fresh refs; {detail:"summary"} reads metadata only. Input invalidates refs; manual observation defers action snapshots, so use guarded batch() or a fresh page_info() checkpoint. list_tabs() returns an array; js() returns {result,snapshot} in auto mode. Watch events before input. Returns output, last expression, completed helper trace, stats and one authoritative snapshot. Nested result snapshots become references with refs_current. Timeouts reset the namespace and connection without replaying input. Only execute assistant-authored code/files.', {
+  register('browser_exec', 'Persistent JavaScript with top-level await, variables/functions, loops and conditions. Await helpers: list_tabs(), select_tab(id), new_tab(url), close_tab(id), goto_url(url,options), page_info(options), click(ref,options), fill(ref,text,options), select(ref,values,options), press(key,ref,options), scroll(options), click_at_xy(x,y,options), type_text(text), js(expression,options), cdp(method,params,options), wait_for_load(state), wait_for(condition,options), wait_for_element(selector,{state,frame_id,timeout_ms}), upload(paths,ref,options), batch(actions,options), handle_dialog(accept,prompt,options), console_messages(options), network_requests(options), route(pattern,options), pdf(options), watch_events(), drain_events(options), wait_for_network_idle(options), sleep(ms), print(...). Ordinary browser_* tools are callable with argument objects except browser_status/browser_exec. page_info() returns fresh refs; {detail:"summary"} reads metadata only. Input invalidates refs; manual observation defers action snapshots, so use guarded batch() or a fresh page_info() checkpoint. list_tabs() returns an array; js() returns {result,snapshot} in auto mode. Watch events before input. Returns output, last expression, completed helper trace, stats and one authoritative snapshot. Nested result snapshots become references with refs_current. Timeouts reset the namespace and connection without replaying input. Only execute assistant-authored code/files.', {
     tab_id: tab, code: z.string().trim().min(1).max(50000),
     timeout_ms: z.number().int().min(100).max(config.requestTimeout - 1000).default(config.requestTimeout - 2000),
     observation: z.enum(['auto', 'manual']).default('auto').describe('auto keeps action snapshots; manual defers them to page_info() checkpoints and one final snapshot. Use batch() for known refs; input invalidates refs.'),

@@ -157,7 +157,7 @@ References retain actual DOM nodes. A layout change cannot silently turn an old 
 | `browser_select_tab` | Select and foreground a tab, return a snapshot |
 | `browser_new_tab`, `browser_close_tab` | Open or explicitly close a tab |
 | `browser_handle_dialog` | Accept or dismiss a JavaScript alert, confirmation or prompt |
-| `browser_snapshot` | Read bounded page text and interactive elements across frames and open shadow roots |
+| `browser_snapshot` | Read bounded page text and interactive elements (`mode: "dom"`), Playwright accessibility tree (`"aria"`), or `"both"` |
 | `browser_click`, `browser_fill` | Click or replace input text using a current reference |
 | `browser_batch` | Perform a guarded sequence of known actions and observe once |
 | `browser_exec` | Run persistent JavaScript with browser helpers, conditions and loops in one MCP call |
@@ -170,10 +170,14 @@ References retain actual DOM nodes. A layout change cannot silently turn an old 
 | `browser_screenshot` | Viewport, full page or element JPEG; optional longest-edge limit |
 | `browser_tap` | Click viewport CSS pixel coordinates for canvas or visual controls |
 | `browser_evaluate` | JavaScript fallback with a result and fresh snapshot |
+| `browser_console_messages` | Watch or drain console logs and uncaught exceptions on the selected tab |
+| `browser_network_requests` | Watch, drain, or wait for network idle on the selected tab |
+| `browser_route` | Add, list, or remove request mocks/interceptions (`fulfill`, `continue`, `abort`) |
+| `browser_pdf` | Export the selected tab to PDF via CDP `Page.printToPDF` (file path or base64) |
 
 Tools return JSON text and structured results; screenshots additionally return MCP image content. Errors have `isError: true` and an error code, message, and recovery guidance. Requests are serialized and bounded. On a request timeout, the connection is reset; inspect the page before repeating an action because it may have executed. Startup and tool discovery work even when Chrome is unavailable. Normal stdio output contains only MCP messages.
 
-`browser_exec` maps Browser Use's persistent exec interface to async JavaScript on Node/Termux. Variables and functions survive between calls. Helpers include `list_tabs`, `select_tab`, `new_tab`, `goto_url`, `page_info`, `click`, `fill`, `select`, `press`, `scroll`, `click_at_xy`, `type_text`, `js`, `cdp`, `wait_for_load`, `wait_for`, `upload` and `batch`. Existing `browser_*` tools are callable with their argument objects, except `browser_status` and `browser_exec`. Await helpers and refresh refs after each action:
+`browser_exec` maps Browser Use's persistent exec interface to async JavaScript on Node/Termux. Variables and functions survive between calls. Helpers include `list_tabs`, `select_tab`, `new_tab`, `goto_url`, `page_info`, `click`, `fill`, `select`, `press`, `scroll`, `click_at_xy`, `type_text`, `js`, `cdp`, `wait_for_load`, `wait_for`, `upload`, `batch`, `console_messages`, `network_requests`, `route` and `pdf`. Existing `browser_*` tools are callable with their argument objects, except `browser_status` and `browser_exec`. Await helpers and refresh refs after each action:
 
 ```js
 browser_exec({
