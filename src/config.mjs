@@ -20,13 +20,17 @@ export function readConfig(env = process.env) {
   if (!Array.isArray(helperFiles) || helperFiles.length > 5 || helperFiles.some(path => typeof path !== 'string')) {
     throw new Error('CHROME_HELPER_FILES must be a JSON array of at most five paths.');
   }
+  const flowDir = env.CHROME_FLOW_DIR || undefined;
+  if (flowDir !== undefined && (!flowDir.startsWith('/') || flowDir.length > 4096)) {
+    throw new Error('CHROME_FLOW_DIR must be an absolute directory path.');
+  }
   return {
     endpoint,
     autoAdb: env.CHROME_AUTO_ADB !== '0',
     serial: env.ANDROID_SERIAL || undefined,
     package: env.CHROME_ANDROID_PACKAGE || 'com.android.chrome',
     socket: env.CHROME_DEVTOOLS_SOCKET || 'chrome_devtools_remote',
-    toolMode, helperFiles,
+    toolMode, helperFiles, flowDir,
     actionTimeout: number('CHROME_ACTION_TIMEOUT_MS', 8000, 1000, 30000),
     requestTimeout: number('CHROME_REQUEST_TIMEOUT_MS', 30000, 10000, 60000),
   };

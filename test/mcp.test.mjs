@@ -216,6 +216,7 @@ test('MCP discovers tools without Chrome or API keys and gives actionable connec
     assert(tools.some(tool => tool.name === 'browser_network_requests'));
     assert(tools.some(tool => tool.name === 'browser_route'));
     assert(tools.some(tool => tool.name === 'browser_pdf'));
+    assert(tools.some(tool => tool.name === 'browser_flow'));
     const { response, data } = await session.call('browser_status');
     assert.equal(response.isError, true);
     assert.equal(data.error.code, 'CDP_UNAVAILABLE');
@@ -339,12 +340,30 @@ test('ADB passes configuration as arguments, validates timeouts, and bounds requ
   await assert.rejects(forwardChrome(readConfig({}), async () => { adbStarted = true; }, { signal: abort.signal }));
   assert.equal(adbStarted, false);
   assert.throws(() => readConfig({ CHROME_ACTION_TIMEOUT_MS: 'NaN' }));
+  assert.throws(() => readConfig({ CHROME_FLOW_DIR: 'relative/flows' }));
   await assert.rejects(withDeadline(() => new Promise(() => {}), 20), error => error.code === 'REQUEST_TIMEOUT');
 });
 
-test('console, network, route, pdf, and aria snapshot tools work end-to-end', async () => {
+test('console, network, route, pdf, flow, and aria snapshot tools work end-to-end', async () => {
   const relay = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise(resolve => relay.once('listening', resolve));
+  const apiSite = createHttpServer((request, response) => {
+    const parsed = new URL(request.url, 'http://127.0.0.1');
+    response.setHeader('content-type', 'application/json');
+    if (parsed.pathname === '/api/v1/drift') {
+      return response.end(JSON.stringify({ changed: true }));
+    }
+    const q = parsed.searchParams.get('q') || '';
+    response.end(JSON.stringify({
+      crates: [
+        { name: q || 'terminal', downloads: q === 'http' ? 1252432606 : 37801, version: '1.0.0' },
+        { name: 'r3bl_tui', downloads: 423636, version: '2.0.0' },
+        { name: 'ftui-core', downloads: 64689, version: '0.5.0' },
+      ],
+    }));
+  });
+  await new Promise(resolve => apiSite.listen(0, '127.0.0.1', resolve));
+  const apiBase = `http://127.0.0.1:${apiSite.address().port}`;
   const tempDir = await mkdtemp(join(tmpdir(), 'chrome-control-pdf-'));
   let app;
   let client;
@@ -354,6 +373,7 @@ test('console, network, route, pdf, and aria snapshot tools work end-to-end', as
     let eventSession;
     let pdfUnsupported = false;
     let connected = true;
+    const responseBodies = new Map();
     const makeHandle = value => ({
       getProperty: async key => {
         if (key === 'data') return { jsonValue: async () => value, dispose: async () => {} };
@@ -395,9 +415,12 @@ test('console, network, route, pdf, and aria snapshot tools work end-to-end', as
       pages: () => [page],
       newCDPSession: async () => {
         const session = Object.assign(new EventEmitter(), {
-          send: async method => {
+          send: async (method, params) => {
             if (method === 'Target.getTargetInfo') return { targetInfo };
             if (method === 'Network.enable') { eventSession = session; return {}; }
+            if (method === 'Network.getResponseBody') {
+              return { body: responseBodies.get(params.requestId) || '{}', base64Encoded: false };
+            }
             if (method === 'Runtime.enable' || method === 'Page.enable') return {};
             if (method === 'Page.printToPDF') {
               if (pdfUnsupported) throw new Error('PrintToPDF is not implemented');
@@ -533,11 +556,94 @@ test('console, network, route, pdf, and aria snapshot tools work end-to-end', as
     });
     assert.equal(execResult.data.ok, true, JSON.stringify(execResult.data));
     assert.deepEqual(execResult.data.result, { routesBefore: 1, bytes: 13 });
+
+    targetInfo.url = `${apiBase}/search?q=terminal`;
+    const flowCapture = await call('browser_flow', { operation: 'capture' });
+    assert.equal(flowCapture.data.capturing, true);
+    assert.equal(flowCapture.data.newly_started, true);
+
+    responseBodies.set('f_telemetry', JSON.stringify({ ok: true }));
+    eventSession.emit('Network.requestWillBeSent', { requestId: 'f_telemetry', type: 'Fetch', request: { url: `${apiBase}/collect`, method: 'POST', postData: '{}' } });
+    eventSession.emit('Network.responseReceived', { requestId: 'f_telemetry', response: { url: `${apiBase}/collect`, status: 200, mimeType: 'application/json' } });
+    eventSession.emit('Network.loadingFinished', { requestId: 'f_telemetry' });
+
+    responseBodies.set('f_crates', JSON.stringify({
+      crates: [
+        { name: 'terminal', downloads: 37801, version: '1.0.0' },
+        { name: 'r3bl_tui', downloads: 423636, version: '2.0.0' },
+        { name: 'ftui-core', downloads: 64689, version: '0.5.0' },
+      ],
+    }));
+    eventSession.emit('Network.requestWillBeSent', {
+      requestId: 'f_crates',
+      type: 'Fetch',
+      request: {
+        url: `${apiBase}/api/v1/crates?q=terminal`,
+        method: 'GET',
+        headers: { Accept: 'application/json', Cookie: 'session=secret', 'X-Request-Id': 'req-1' },
+      },
+    });
+    eventSession.emit('Network.responseReceived', { requestId: 'f_crates', response: { url: `${apiBase}/api/v1/crates?q=terminal`, status: 200, mimeType: 'application/json' } });
+    eventSession.emit('Network.loadingFinished', { requestId: 'f_crates' });
+
+    const flowStatus = await call('browser_flow', { operation: 'status' });
+    assert.equal(flowStatus.data.capturing, true);
+    assert.equal(flowStatus.data.candidates.length, 1, 'Telemetry endpoints must be excluded from flow candidates');
+    assert.equal(flowStatus.data.candidates[0].url, `${apiBase}/api/v1/crates?q=terminal`);
+
+    const flowPath = join(tempDir, 'crates.json');
+    const savedFlow = await call('browser_flow', { operation: 'save', name: 'crates', params: { q: 'terminal' }, path: flowPath });
+    assert.equal(savedFlow.data.saved, true);
+    assert.equal(savedFlow.data.url_template, `${apiBase}/api/v1/crates?q={{q}}`);
+    assert.deepEqual(savedFlow.data.item_fields, ['name', 'downloads', 'version']);
+
+    const savedJson = JSON.parse(await readFile(flowPath, 'utf8'));
+    assert.equal(savedJson.headers.Cookie, undefined, 'Cookie header must never be saved');
+    assert.equal(savedJson.headers['X-Request-Id'], undefined, 'Per-request tracing headers must be dropped');
+
+    const listedFlows = await call('browser_flow', { operation: 'list' });
+    assert.equal(listedFlows.data.flows.length, 1);
+    assert.equal(listedFlows.data.flows[0].name, 'crates');
+    assert.equal(listedFlows.data.flows[0].inputSchema.properties.q.type, 'string');
+
+    const hintedSnapshot = await call('browser_snapshot');
+    assert.equal(hintedSnapshot.data.saved_flows.length, 1);
+    assert.equal(hintedSnapshot.data.saved_flows[0].name, 'crates');
+
+    const replayHttp = await call('browser_flow', {
+      operation: 'run',
+      name: 'crates',
+      params: { q: 'http' },
+      fields: ['name', 'downloads'],
+      limit: 2,
+    });
+    assert.equal(replayHttp.data.ok, true, JSON.stringify(replayHttp.data));
+    assert.equal(replayHttp.data.tier, 'http');
+    assert.equal(replayHttp.data.verified, true);
+    assert.equal(replayHttp.data.count, 2);
+    assert.equal(replayHttp.data.total, 3);
+    assert.deepEqual(replayHttp.data.items, [
+      { name: 'http', downloads: 1252432606 },
+      { name: 'r3bl_tui', downloads: 423636 },
+    ]);
+
+    const execFlow = await call('browser_exec', {
+      include_snapshot: false,
+      code: 'await flow("run", { name: "crates", params: { q: "cli" }, fields: "name,downloads", limit: 1 });',
+    });
+    assert.equal(execFlow.data.ok, true, JSON.stringify(execFlow.data));
+    assert.deepEqual(execFlow.data.result.items, [{ name: 'cli', downloads: 37801 }]);
+
+    const deletedFlow = await call('browser_flow', { operation: 'delete', name: 'crates', path: flowPath });
+    assert.equal(deletedFlow.data.deleted, true);
+    const stopCapture = await call('browser_flow', { operation: 'stop' });
+    assert.equal(stopCapture.data.capturing, false);
   } finally {
     await client?.close();
     await app?.close();
     for (const socket of relay.clients) socket.terminate();
     await new Promise(resolve => relay.close(resolve));
+    await new Promise(resolve => apiSite.close(resolve));
     await rm(tempDir, { recursive: true, force: true });
   }
 });
@@ -547,6 +653,16 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
   if (!executable) return t.skip('Set CHROME_TEST_EXECUTABLE to a desktop Chromium binary.');
   const site = createHttpServer((request, response) => {
     response.setHeader('content-type', 'text/html');
+    if (request.url.startsWith('/api/items')) {
+      const q = new URL(request.url, 'http://127.0.0.1').searchParams.get('q') || '';
+      response.setHeader('content-type', 'application/json');
+      return response.end(JSON.stringify({
+        items: [
+          { name: q || 'default', length: q.length },
+          { name: `${q || 'default'}-two`, length: q.length + 4 },
+        ],
+      }));
+    }
     if (request.url === '/data') return setTimeout(() => { response.setHeader('content-type', 'application/json'); response.end('{"received":true}'); }, 350);
     if (request.url === '/frame') return response.end(`<label>Frame input <input aria-label="Frame input"></label>
       <input type="file" aria-label="Frame upload" style="display:none" onchange="this.files[0].text().then(text=>parent.postMessage({upload:text},'*'))">
@@ -1007,6 +1123,17 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     const pdfPath = join(uploadDir, 'real.pdf');
     const pdfRes = await invoke('browser_pdf', { path: pdfPath });
     assert(pdfRes.bytes > 0);
+    await invoke('browser_flow', { operation: 'capture' });
+    await invoke('browser_evaluate', { expression: 'fetch("/api/items?q=alpha").then(r => r.json())' });
+    const realFlowSaved = await invoke('browser_flow', { operation: 'save', name: 'items', params: { q: 'alpha' } });
+    assert.equal(realFlowSaved.saved, true);
+    const realFlowSnapshot = await invoke('browser_snapshot');
+    assert(realFlowSnapshot.saved_flows?.some(item => item.name === 'items'));
+    const realFlowRun = await invoke('browser_flow', { operation: 'run', name: 'items', params: { q: 'beta' }, fields: ['name'], limit: 1 });
+    assert.deepEqual(realFlowRun.items, [{ name: 'beta' }]);
+    assert.equal(realFlowRun.verified, true);
+    await invoke('browser_flow', { operation: 'delete', name: 'items' });
+    await invoke('browser_flow', { operation: 'stop' });
     assert.equal(session.stderr(), '');
   } finally {
     await frameObserver?.close();

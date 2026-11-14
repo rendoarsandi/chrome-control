@@ -6,6 +6,7 @@ import { connectTransport } from './cdp-transport.mjs';
 import { collectDOM, observationStamp, scrollDOM } from './dom.mjs';
 import { ControlError, describeError, withDeadline } from './errors.mjs';
 import { PageEvents } from './events.mjs';
+import { FlowCapture, FlowStore } from './flow.mjs';
 
 // Handle release is housekeeping, never a prerequisite for the next request.
 const release = handle => { handle?.dispose().catch(() => {}); };
@@ -16,7 +17,7 @@ const identity = node => JSON.stringify({
 });
 
 export class BrowserController {
-  constructor(chromium, config, { repairForward = false } = {}) {
+  constructor(chromium, config, { repairForward = false, flowStore } = {}) {
     this.chromium = chromium;
     this.config = config;
     this.browser = null;
@@ -43,6 +44,8 @@ export class BrowserController {
     this.snapshotFrames = [];
     this.snapshotCount = 0;
     this.eventStreams = new Map();
+    this.flowCaptures = new Map();
+    this.flowStore = flowStore || new FlowStore(config.flowDir);
     this.routes = new Map();
   }
 
@@ -74,6 +77,8 @@ export class BrowserController {
     this.selected = null;
     for (const stream of this.eventStreams.values()) stream.close();
     this.eventStreams.clear();
+    for (const capture of this.flowCaptures.values()) capture.close();
+    this.flowCaptures.clear();
     this.routes.clear();
     for (const session of this.execSessions.values()) session.detach().catch(() => {});
     this.execSessions.clear();
@@ -164,6 +169,8 @@ export class BrowserController {
     this.selected = null;
     for (const stream of this.eventStreams.values()) stream.close();
     this.eventStreams.clear();
+    for (const capture of this.flowCaptures.values()) capture.close();
+    this.flowCaptures.clear();
     this.routes.clear();
     for (const session of this.execSessions.values()) session.detach().catch(() => {});
     this.execSessions.clear();
@@ -181,6 +188,7 @@ export class BrowserController {
     page.on('close', () => {
       this.dialogs.delete(page); this.fileChoosers.delete(page);
       this.eventStreams.get(page)?.close(); this.eventStreams.delete(page);
+      this.flowCaptures.get(page)?.close(); this.flowCaptures.delete(page);
       this.routes.delete(page);
     });
     page.on('framedetached', frame => {
@@ -372,10 +380,12 @@ export class BrowserController {
       this.assertActive();
       const title = await page.title().catch(() => this.titles.get(page) || '(loading)');
       this.titles.set(page, title);
+      const savedFlows = await this.flowStore.hintsForUrl(page.url());
       return {
         tab_id: id, snapshot_id: snapshotId, mode: 'aria', url: page.url(), title,
         aria_tree: rawAria.slice(0, max_text),
         ...(rawAria.length > max_text ? { aria_truncated: true } : {}),
+        ...(savedFlows.length ? { saved_flows: savedFlows } : {}),
         frames: [], elements: [],
       };
     }
@@ -448,9 +458,12 @@ export class BrowserController {
           warnings.push({ message: `Accessibility tree unavailable: ${error.message}` });
         }
       }
+      const savedFlows = await this.flowStore.hintsForUrl(page.url());
       return this.lastSnapshot = {
         tab_id: id, snapshot_id: snapshotId, ...(mode === 'both' ? { mode } : {}), url: page.url(), title,
-        frames, elements, ...ariaFields, ...(warnings.length ? { warnings } : {}),
+        frames, elements, ...ariaFields,
+        ...(savedFlows.length ? { saved_flows: savedFlows } : {}),
+        ...(warnings.length ? { warnings } : {}),
         reference_help: 'Use ref values from this snapshot. A new snapshot or action invalidates earlier references. Offscreen elements are scrolled into view during interaction.',
       };
     }
@@ -579,6 +592,95 @@ export class BrowserController {
     } finally {
       session?.detach().catch(() => {});
     }
+  }
+
+  async flow(args = {}) {
+    const operation = args.operation || 'list';
+    if (operation === 'list') {
+      return this.flowStore.list({ origin: args.origin, path: args.path });
+    }
+    if (operation === 'delete') {
+      return this.flowStore.remove(args.name, args.path);
+    }
+    if (operation === 'run') {
+      let page = null;
+      if (args.mode === 'page') {
+        page = (await this.page(args.tab_id)).page;
+      } else if (args.mode !== 'http' && this.browser?.isConnected() && (args.tab_id || this.selected)) {
+        try { page = (await this.page(args.tab_id)).page; } catch {}
+      }
+      return this.flowStore.run({
+        name: args.name,
+        params: args.params,
+        fields: args.fields,
+        limit: args.limit,
+        mode: args.mode || 'auto',
+        page,
+        getPage: args.mode === 'http' ? undefined : async () => (await this.page(args.tab_id)).page,
+        timeout: this.config.actionTimeout,
+        path: args.path,
+      });
+    }
+
+    const { page, id } = await this.page(args.tab_id);
+    if (operation === 'capture') {
+      const existing = this.flowCaptures.get(page);
+      if (existing) {
+        if (args.reset !== false) existing.reset();
+        return { tab_id: id, capturing: true, newly_started: false, url: page.url() };
+      }
+      const session = await page.context().newCDPSession(page);
+      if (this.stopped) { session.detach().catch(() => {}); this.assertActive(); }
+      const capture = new FlowCapture(session);
+      this.flowCaptures.set(page, capture);
+      try { await capture.start(); this.assertActive(); }
+      catch (error) { capture.close(); this.flowCaptures.delete(page); throw error; }
+      return { tab_id: id, capturing: true, newly_started: true, url: page.url() };
+    }
+    if (operation === 'stop') {
+      const existing = this.flowCaptures.get(page);
+      const wasCapturing = Boolean(existing);
+      if (existing) {
+        existing.close();
+        this.flowCaptures.delete(page);
+      }
+      return { tab_id: id, capturing: false, was_capturing: wasCapturing };
+    }
+    if (operation === 'status') {
+      const capture = this.flowCaptures.get(page);
+      const candidates = capture ? await capture.candidates(page.url()) : [];
+      return {
+        tab_id: id,
+        capturing: Boolean(capture),
+        url: page.url(),
+        candidates: candidates.map(c => ({
+          id: c.id,
+          method: c.method,
+          url: c.url,
+          status: c.status,
+          has_body: c.requestBody != null,
+        })),
+      };
+    }
+    if (operation === 'save') {
+      const capture = this.flowCaptures.get(page);
+      if (!capture) {
+        throw new ControlError('FLOW_CAPTURE_INACTIVE', 'Flow capture is not active on this tab.', 'Call browser_flow({ operation: "capture" }) before triggering the request, then save.');
+      }
+      const candidates = await capture.candidates(page.url());
+      const saved = await this.flowStore.buildAndSave({
+        name: args.name,
+        description: args.description,
+        pageUrl: page.url(),
+        candidates,
+        secrets: [...capture.secrets],
+        requestId: args.request_id,
+        params: args.params,
+        path: args.path,
+      });
+      return { tab_id: id, ...saved };
+    }
+    throw new ControlError('FLOW_OPERATION_INVALID', `Unknown flow operation: ${operation}`, 'Use capture, stop, status, save, run, list, or delete.');
   }
 
   async target(ref, page) {
@@ -753,7 +855,13 @@ export class BrowserController {
         if (!['click', 'wait'].includes(name)) this.noteInput(name, id);
         switch (name) {
           case 'click': await this.click(page, target, timeout); break;
-          case 'fill': await target.fill(args.text, { timeout }); break;
+          case 'fill': {
+            const capture = this.flowCaptures.get(page);
+            const isPassword = capture ? await target.evaluate(node => node.tagName === 'INPUT' && node.type === 'password').catch(() => false) : false;
+            await target.fill(args.text, { timeout });
+            capture?.noteInput(args.text, isPassword);
+            break;
+          }
           case 'select': await target.selectOption(args.values, { timeout }); break;
           case 'press':
             if (target) await target.press(args.key, { timeout, noWaitAfter: true });

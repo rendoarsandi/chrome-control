@@ -174,10 +174,11 @@ References retain actual DOM nodes. A layout change cannot silently turn an old 
 | `browser_network_requests` | Watch, drain, or wait for network idle on the selected tab |
 | `browser_route` | Add, list, or remove request mocks/interceptions (`fulfill`, `continue`, `abort`) |
 | `browser_pdf` | Export the selected tab to PDF via CDP `Page.printToPDF` (file path or base64) |
+| `browser_flow` | Capture first-party JSON API requests, save parameterized flows, list schemas, and replay over HTTP or in-page fetch |
 
 Tools return JSON text and structured results; screenshots additionally return MCP image content. Errors have `isError: true` and an error code, message, and recovery guidance. Requests are serialized and bounded. On a request timeout, the connection is reset; inspect the page before repeating an action because it may have executed. Startup and tool discovery work even when Chrome is unavailable. Normal stdio output contains only MCP messages.
 
-`browser_exec` maps Browser Use's persistent exec interface to async JavaScript on Node/Termux. Variables and functions survive between calls. Helpers include `list_tabs`, `select_tab`, `new_tab`, `goto_url`, `page_info`, `click`, `fill`, `select`, `press`, `scroll`, `click_at_xy`, `type_text`, `js`, `cdp`, `wait_for_load`, `wait_for`, `upload`, `batch`, `console_messages`, `network_requests`, `route` and `pdf`. Existing `browser_*` tools are callable with their argument objects, except `browser_status` and `browser_exec`. Await helpers and refresh refs after each action:
+`browser_exec` maps Browser Use's persistent exec interface to async JavaScript on Node/Termux. Variables and functions survive between calls. Helpers include `list_tabs`, `select_tab`, `new_tab`, `goto_url`, `page_info`, `click`, `fill`, `select`, `press`, `scroll`, `click_at_xy`, `type_text`, `js`, `cdp`, `wait_for_load`, `wait_for`, `upload`, `batch`, `console_messages`, `network_requests`, `route`, `pdf` and `flow`. Existing `browser_*` tools are callable with their argument objects, except `browser_status` and `browser_exec`. Await helpers and refresh refs after each action:
 
 ```js
 browser_exec({
@@ -244,6 +245,7 @@ JavaScript dialogs remain open for the assistant to inspect and explicitly accep
 | `CHROME_REQUEST_TIMEOUT_MS` | `30000` | Tool execution deadline, 10000–60000 ms |
 | `CHROME_TOOL_MODE` | `full` | `compact` exposes three tools while keeping all exec helpers |
 | `CHROME_HELPER_FILES` | `[]` | JSON array of absolute paths to assistant-authored JS helper files |
+| `CHROME_FLOW_DIR` | unset | Optional absolute directory path to persist saved `browser_flow` JSON files |
 
 ## Troubleshooting and limits
 
