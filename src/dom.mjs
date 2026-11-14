@@ -4,7 +4,7 @@ export function collectDOM({ maxElements, maxText }) {
   const roots = [document];
   const shadowText = [];
   const candidates = [];
-  const interactive = 'a,button,input:not([type="hidden"]),textarea,select,summary,img[alt],[onclick],[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="tab"],[role="textbox"],[role="combobox"],[role="menuitem"],[role="switch"],[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"])';
+  const interactive = 'a,button,input:not([type="hidden"]),textarea,select,summary,img[alt],[onclick],[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="tab"],[role="textbox"],[role="combobox"],[role="menuitem"],[role="switch"],[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),video,audio';
   const scrollable = element => {
     if (element.scrollHeight <= element.clientHeight + 1 && element.scrollWidth <= element.clientWidth + 1) return false;
     const style = getComputedStyle(element);
@@ -59,20 +59,25 @@ export function collectDOM({ maxElements, maxText }) {
   const elements = [];
   let total = 0;
   for (const element of new Set(candidates)) {
+    const isMedia = element.tagName === 'VIDEO' || element.tagName === 'AUDIO';
+    const mediaSrc = isMedia ? (element.currentSrc || element.getAttribute('src') || element.querySelector('source[src]')?.src || '') : '';
     // Upload widgets often hide their input and open it from a visible button.
-    if (!visible(element) && element.type !== 'file') continue;
+    if (!visible(element) && element.type !== 'file' && !(isMedia && (mediaSrc || element.controls))) continue;
     if (element.tagName === 'A' && !element.hasAttribute('href') && !element.hasAttribute('onclick') && getComputedStyle(element).cursor !== 'pointer') continue;
     total++;
     if (elements.length >= maxElements) continue;
     const root = element.getRootNode();
     const labelledBy = (element.getAttribute('aria-labelledby') || '').split(/\s+/)
       .map(id => root.getElementById?.(id)?.textContent || '').join(' ').trim();
+    const mediaLabel = isMedia
+      ? ((mediaSrc && !mediaSrc.startsWith('data:') && !mediaSrc.startsWith('blob:') ? mediaSrc.split('/').pop()?.split('?')[0] : '') || element.tagName.toLowerCase())
+      : '';
     const label = element.getAttribute('aria-label') || labelledBy ||
       Array.from(element.labels || []).map(item => item.innerText).join(' ') || element.innerText ||
       element.getAttribute('placeholder') || element.getAttribute('title') ||
       element.getAttribute('alt') || element.querySelector('img[alt]')?.getAttribute('alt') ||
       (['submit', 'button'].includes(element.type) ? element.value : '') ||
-      (element.type === 'file' ? 'Choose file' : scrollable(element) ? `Scrollable ${element.tagName.toLowerCase()}` : '');
+      (element.type === 'file' ? 'Choose file' : isMedia ? mediaLabel : scrollable(element) ? `Scrollable ${element.tagName.toLowerCase()}` : '');
     const box = element.getBoundingClientRect();
     const value = 'value' in element && !['password', 'file'].includes(element.type) ? String(element.value) : undefined;
     const options = element.tagName === 'SELECT' ? Array.from(element.options) : undefined;
@@ -93,6 +98,16 @@ export function collectDOM({ maxElements, maxText }) {
       ...(options ? { options: shownOptions.map(option => ({ value: option.value, label: option.label, selected: option.selected })), ...(shownOptions.length < options.length ? { options_truncated: true } : {}) } : {}),
       ...(element.tagName === 'A' && element.hasAttribute('href') ? { href: element.href } : {}),
       ...(element.tagName === 'IMG' ? { image: { loaded: element.complete && element.naturalWidth > 0, width: element.naturalWidth, height: element.naturalHeight } } : {}),
+      ...(isMedia ? {
+        media: {
+          src: mediaSrc.slice(0, 2000),
+          duration: Number.isFinite(element.duration) ? Math.round(element.duration * 100) / 100 : null,
+          paused: Boolean(element.paused),
+          muted: Boolean(element.muted),
+          ended: Boolean(element.ended),
+          ...(element.tagName === 'VIDEO' ? { width: element.videoWidth || 0, height: element.videoHeight || 0 } : {}),
+        },
+      } : {}),
       ...(scrollable(element) ? { scroll: { x: element.scrollLeft, y: element.scrollTop, max_x: element.scrollWidth - element.clientWidth, max_y: element.scrollHeight - element.clientHeight } } : {}),
     });
     nodes.push(element);

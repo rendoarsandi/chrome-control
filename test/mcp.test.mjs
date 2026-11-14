@@ -217,6 +217,7 @@ test('MCP discovers tools without Chrome or API keys and gives actionable connec
     assert(tools.some(tool => tool.name === 'browser_route'));
     assert(tools.some(tool => tool.name === 'browser_pdf'));
     assert(tools.some(tool => tool.name === 'browser_flow'));
+    assert(tools.some(tool => tool.name === 'browser_media'));
     const { response, data } = await session.call('browser_status');
     assert.equal(response.isError, true);
     assert.equal(data.error.code, 'CDP_UNAVAILABLE');
@@ -349,6 +350,14 @@ test('console, network, route, pdf, flow, and aria snapshot tools work end-to-en
   await new Promise(resolve => relay.once('listening', resolve));
   const apiSite = createHttpServer((request, response) => {
     const parsed = new URL(request.url, 'http://127.0.0.1');
+    if (parsed.pathname === '/media/sample.mp4') {
+      response.setHeader('content-type', 'video/mp4');
+      return response.end(Buffer.from('MOCK-MP4-BYTES'));
+    }
+    if (parsed.pathname === '/media/sample.mp3') {
+      response.setHeader('content-type', 'audio/mpeg');
+      return response.end(Buffer.from('MOCK-MP3-BYTES'));
+    }
     response.setHeader('content-type', 'application/json');
     if (parsed.pathname === '/api/v1/drift') {
       return response.end(JSON.stringify({ changed: true }));
@@ -382,18 +391,98 @@ test('console, network, route, pdf, flow, and aria snapshot tools work end-to-en
       },
       dispose: async () => {},
     });
+    const mockMediaState = {
+      tag: 'video',
+      src: `${apiBase}/media/sample.mp4`,
+      current_time: 0,
+      duration: 12.5,
+      paused: true,
+      muted: false,
+      ended: false,
+      playback_rate: 1,
+    };
+    const mockMediaElement = {
+      asElement: () => mockMediaElement,
+      ownerFrame: async () => mainFrame,
+      evaluate: async (fn, arg = {}) => {
+        if (fn.name === 'inspectElementMedia') {
+          return { ...mockMediaState, sources: [], tracks: [] };
+        }
+        if (fn.name === 'recordElementMedia') {
+          return {
+            ok: true,
+            mime_type: arg.audioOnly ? 'audio/webm' : 'video/webm',
+            bytes: 14,
+            data_base64: Buffer.from('MOCK-WEBM-CLIP').toString('base64'),
+            current_time: 1.5,
+            duration: 12.5,
+          };
+        }
+        if (fn.name === 'controlElementMedia') {
+          if (typeof arg.currentTime === 'number') mockMediaState.current_time = arg.currentTime;
+          if (typeof arg.muted === 'boolean') mockMediaState.muted = arg.muted;
+          if (typeof arg.playbackRate === 'number') mockMediaState.playback_rate = arg.playbackRate;
+          if (arg.controlAction === 'play') mockMediaState.paused = false;
+          if (arg.controlAction === 'pause') mockMediaState.paused = true;
+          if (arg.controlAction === 'mute') mockMediaState.muted = true;
+          if (arg.controlAction === 'unmute') mockMediaState.muted = false;
+          return { ...mockMediaState };
+        }
+        return null;
+      },
+      dispose: async () => {},
+    };
     const mainFrame = {
       url: () => targetInfo.url,
       name: () => '',
       isDetached: () => false,
-      evaluateHandle: async () => makeHandle({
-        stamp: 'stamp-1',
-        title: targetInfo.title,
-        text: 'Hello Mock',
-        text_truncated: false,
-        elements: [{ index: 0, tag: 'button', role: 'button', name: 'Submit', disabled: false, in_viewport: true }],
-        elements_truncated: false,
-      }),
+      evaluate: async (fn, arg = {}) => {
+        if (fn.name === 'collectFrameMedia') {
+          return [{
+            index: 0,
+            ...mockMediaState,
+            sources: [],
+            poster: '',
+            ready_state: 4,
+            width: 640,
+            height: 360,
+            is_blob: false,
+            tracks: [],
+          }];
+        }
+        if (fn.name === 'fetchMediaInPage') {
+          if (arg.mediaUrl === `${apiBase}/media/sample.mp3`) {
+            return {
+              ok: true,
+              mime_type: 'audio/mpeg',
+              bytes: 14,
+              data_base64: Buffer.from('MOCK-MP3-BYTES').toString('base64'),
+            };
+          }
+          return { ok: false, error: 'Cross-origin fetch simulated failure' };
+        }
+        return null;
+      },
+      evaluateHandle: async fn => {
+        if (fn?.name === 'findFrameMediaElements') {
+          return {
+            getProperty: async key => {
+              if (key === 'length') return { jsonValue: async () => 1, dispose: async () => {} };
+              if (key === '0') return mockMediaElement;
+              return { dispose: async () => {} };
+            },
+            dispose: async () => {},
+          };
+        }
+        return makeHandle({
+          stamp: 'stamp-1',
+          title: targetInfo.title,
+          text: 'Hello Mock',
+          text_truncated: false,
+          elements: [{ index: 0, tag: 'button', role: 'button', name: 'Submit', disabled: false, in_viewport: true }],
+          elements_truncated: false,
+        });
+      },
     };
     const page = Object.assign(new EventEmitter(), {
       isClosed: () => false,
@@ -638,6 +727,82 @@ test('console, network, route, pdf, flow, and aria snapshot tools work end-to-en
     assert.equal(deletedFlow.data.deleted, true);
     const stopCapture = await call('browser_flow', { operation: 'stop' });
     assert.equal(stopCapture.data.capturing, false);
+
+    const inspectedMedia = await call('browser_media', { operation: 'inspect' });
+    assert.equal(inspectedMedia.data.ok, true, JSON.stringify(inspectedMedia.data));
+    assert.equal(inspectedMedia.data.media.length, 1);
+    assert.equal(inspectedMedia.data.media[0].src, `${apiBase}/media/sample.mp4`);
+
+    const badMediaPath = await call('browser_media', { operation: 'download', path: 'relative.mp4' });
+    assert.equal(badMediaPath.response.isError, true);
+    assert.equal(badMediaPath.data.error.code, 'MEDIA_PATH_INVALID');
+
+    const explicitMediaPath = join(tempDir, 'downloaded.mp4');
+    const downloadedMedia = await call('browser_media', { operation: 'download', path: explicitMediaPath });
+    assert.equal(downloadedMedia.data.ok, true, JSON.stringify(downloadedMedia.data));
+    assert.equal(downloadedMedia.data.method, 'fetch');
+    assert.equal(downloadedMedia.data.mime_type, 'video/mp4');
+    assert.equal(downloadedMedia.data.path, explicitMediaPath);
+    assert.equal(await readFile(explicitMediaPath, 'utf8'), 'MOCK-MP4-BYTES');
+
+    const pageFetchedAudio = await call('browser_media', {
+      operation: 'download',
+      url: `${apiBase}/media/sample.mp3`,
+      mode: 'page',
+    });
+    assert.equal(pageFetchedAudio.data.ok, true, JSON.stringify(pageFetchedAudio.data));
+    assert.equal(pageFetchedAudio.data.method, 'page');
+    assert.equal(pageFetchedAudio.data.mime_type, 'audio/mpeg');
+    assert(pageFetchedAudio.data.path.endsWith('.mp3'));
+    assert.equal(await readFile(pageFetchedAudio.data.path, 'utf8'), 'MOCK-MP3-BYTES');
+    await rm(pageFetchedAudio.data.path, { force: true });
+
+    const dataUrlAudio = await call('browser_media', {
+      operation: 'download',
+      url: `data:audio/wav;base64,${Buffer.from('MOCK-WAV').toString('base64')}`,
+    });
+    assert.equal(dataUrlAudio.data.ok, true, JSON.stringify(dataUrlAudio.data));
+    assert.equal(dataUrlAudio.data.method, 'data');
+    assert(dataUrlAudio.data.path.endsWith('.wav'));
+    assert.equal(await readFile(dataUrlAudio.data.path, 'utf8'), 'MOCK-WAV');
+    await rm(dataUrlAudio.data.path, { force: true });
+
+    const recordedClipPath = join(tempDir, 'clip.webm');
+    const recordedMedia = await call('browser_media', {
+      operation: 'record',
+      duration_ms: 500,
+      path: recordedClipPath,
+    });
+    assert.equal(recordedMedia.data.ok, true, JSON.stringify(recordedMedia.data));
+    assert.equal(recordedMedia.data.method, 'record');
+    assert.equal(recordedMedia.data.mime_type, 'video/webm');
+    assert.equal(await readFile(recordedClipPath, 'utf8'), 'MOCK-WEBM-CLIP');
+
+    const controlledMedia = await call('browser_media', {
+      operation: 'control',
+      control_action: 'play',
+      current_time: 3.5,
+      muted: true,
+      playback_rate: 1.5,
+    });
+    assert.equal(controlledMedia.data.ok, true, JSON.stringify(controlledMedia.data));
+    assert.equal(controlledMedia.data.media.paused, false);
+    assert.equal(controlledMedia.data.media.muted, true);
+    assert.equal(controlledMedia.data.media.current_time, 3.5);
+    assert.equal(controlledMedia.data.media.playback_rate, 1.5);
+
+    const execMediaPath = join(tempDir, 'exec-media.mp4');
+    const execMedia = await call('browser_exec', {
+      include_snapshot: false,
+      code: [
+        'var listed = await media("inspect");',
+        `var saved = await media("download", { path: ${JSON.stringify(execMediaPath)} });`,
+        '({ count: listed.media.length, bytes: saved.bytes, method: saved.method });',
+      ].join('\n'),
+    });
+    assert.equal(execMedia.data.ok, true, JSON.stringify(execMedia.data));
+    assert.deepEqual(execMedia.data.result, { count: 1, bytes: 14, method: 'fetch' });
+    assert.equal(await readFile(execMediaPath, 'utf8'), 'MOCK-MP4-BYTES');
   } finally {
     await client?.close();
     await app?.close();
@@ -662,6 +827,15 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
           { name: `${q || 'default'}-two`, length: q.length + 4 },
         ],
       }));
+    }
+    if (request.url === '/media/sample.mp4') {
+      response.setHeader('content-type', 'video/mp4');
+      return response.end(Buffer.from('REAL-BROWSER-MP4'));
+    }
+    if (request.url === '/media-page') {
+      return response.end(`<!doctype html><title>Media fixture</title>
+        <video controls src="/media/sample.mp4"></video>
+        <audio controls src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="></audio>`);
     }
     if (request.url === '/data') return setTimeout(() => { response.setHeader('content-type', 'application/json'); response.end('{"received":true}'); }, 350);
     if (request.url === '/frame') return response.end(`<label>Frame input <input aria-label="Frame input"></label>
@@ -1134,6 +1308,23 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     assert.equal(realFlowRun.verified, true);
     await invoke('browser_flow', { operation: 'delete', name: 'items' });
     await invoke('browser_flow', { operation: 'stop' });
+    snapshot = (await invoke('browser_navigate', { url: `${base}/media-page` })).snapshot;
+    const videoElem = snapshot.elements.find(element => element.tag === 'video');
+    const audioElem = snapshot.elements.find(element => element.tag === 'audio');
+    assert(videoElem && audioElem, 'Snapshots must discover video and audio elements with refs');
+    const inspected = await invoke('browser_media', { operation: 'inspect' });
+    assert.equal(inspected.media.length, 2);
+    const realVideoPath = join(uploadDir, 'real-video.mp4');
+    const realVideo = await invoke('browser_media', { operation: 'download', ref: videoElem.ref, path: realVideoPath });
+    assert.equal(realVideo.bytes, 16);
+    assert.equal(await readFile(realVideoPath, 'utf8'), 'REAL-BROWSER-MP4');
+    const realAudio = await invoke('browser_media', { operation: 'download', ref: audioElem.ref });
+    assert.equal(realAudio.method, 'data');
+    assert(realAudio.path.endsWith('.wav'));
+    await rm(realAudio.path, { force: true });
+    const realControl = await invoke('browser_media', { operation: 'control', ref: audioElem.ref, control_action: 'mute', playback_rate: 1.5 });
+    assert.equal(realControl.media.muted, true);
+    assert.equal(realControl.media.playback_rate, 1.5);
     assert.equal(session.stderr(), '');
   } finally {
     await frameObserver?.close();

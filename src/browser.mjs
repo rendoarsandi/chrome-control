@@ -7,6 +7,18 @@ import { collectDOM, observationStamp, scrollDOM } from './dom.mjs';
 import { ControlError, describeError, withDeadline } from './errors.mjs';
 import { PageEvents } from './events.mjs';
 import { FlowCapture, FlowStore } from './flow.mjs';
+import {
+  MAX_MEDIA_BYTES,
+  collectFrameMedia,
+  controlElementMedia,
+  fetchMediaFromNode,
+  fetchMediaInPage,
+  findFrameMediaElements,
+  inspectElementMedia,
+  parseDataUrl,
+  recordElementMedia,
+  resolveMediaOutputPath,
+} from './media.mjs';
 
 // Handle release is housekeeping, never a prerequisite for the next request.
 const release = handle => { handle?.dispose().catch(() => {}); };
@@ -681,6 +693,324 @@ export class BrowserController {
       return { tab_id: id, ...saved };
     }
     throw new ControlError('FLOW_OPERATION_INVALID', `Unknown flow operation: ${operation}`, 'Use capture, stop, status, save, run, list, or delete.');
+  }
+
+  async findMediaElement(page, { mediaType = 'any', index = 0 } = {}) {
+    let remaining = index;
+    for (const frame of page.frames().slice(0, 25)) {
+      let listHandle;
+      try {
+        listHandle = await frame.evaluateHandle(findFrameMediaElements, { mediaType });
+        const lenHandle = await listHandle.getProperty('length');
+        const count = await lenHandle.jsonValue();
+        release(lenHandle);
+        if (remaining < count) {
+          const itemHandle = await listHandle.getProperty(String(remaining));
+          const element = itemHandle.asElement();
+          if (element) return element;
+          release(itemHandle);
+        }
+        remaining -= count;
+      } catch {
+        // Ignore detached or unreachable child frames during media discovery.
+      } finally {
+        release(listHandle);
+      }
+    }
+    return null;
+  }
+
+  async resolveMediaTarget(page, args) {
+    const operation = args.operation || 'download';
+    if (args.ref) {
+      const rawTarget = await this.target(args.ref, page);
+      try {
+        const info = await rawTarget.evaluate(node => {
+          const media = (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') ? node : node.querySelector('video, audio');
+          if (media) return { kind: 'media', isSelf: media === node };
+          if (node.tagName === 'A' && node.href) return { kind: 'link', href: node.href };
+          return { kind: 'invalid' };
+        });
+        if (info.kind === 'media') {
+          if (info.isSelf) {
+            const frame = await rawTarget.ownerFrame().catch(() => page.mainFrame());
+            return { element: rawTarget, directUrl: null, frame: frame || page.mainFrame() };
+          }
+          const resolvedHandle = await rawTarget.evaluateHandle(node => node.querySelector('video, audio'));
+          const element = resolvedHandle.asElement();
+          if (!element) {
+            release(resolvedHandle);
+            throw new ControlError('MEDIA_TARGET_INVALID', 'The target media element could not be resolved.', 'Inspect a fresh browser_snapshot and try again.');
+          }
+          const frame = await element.ownerFrame().catch(() => page.mainFrame());
+          release(rawTarget);
+          return { element, directUrl: null, frame: frame || page.mainFrame() };
+        }
+        release(rawTarget);
+        if (info.kind === 'link' && operation === 'download') {
+          return { element: null, directUrl: info.href, frame: page.mainFrame() };
+        }
+        throw new ControlError(
+          'MEDIA_TARGET_INVALID',
+          'The selected element is not a video, audio, player container, or media link.',
+          'Select a video or audio ref from browser_snapshot or omit ref to match media on the page.',
+        );
+      } catch (error) {
+        release(rawTarget);
+        throw error;
+      }
+    }
+    if (args.url && operation === 'download') {
+      let resolved;
+      try {
+        resolved = new URL(args.url, page.url() || undefined);
+      } catch {
+        throw new ControlError('MEDIA_URL_INVALID', 'Media URL is not valid.', 'Provide a valid http, https, blob, or data URL.');
+      }
+      if (!['http:', 'https:', 'blob:', 'data:'].includes(resolved.protocol)) {
+        throw new ControlError('MEDIA_URL_INVALID', `Unsupported media URL protocol: ${resolved.protocol}`, 'Provide an http, https, blob, or data URL.');
+      }
+      return { element: null, directUrl: resolved.href, frame: page.mainFrame() };
+    }
+    const element = await this.findMediaElement(page, { mediaType: args.media_type || 'any', index: args.index ?? 0 });
+    if (!element) {
+      throw new ControlError(
+        'MEDIA_NOT_FOUND',
+        'No matching video or audio element was found on the page.',
+        'Inspect the page with browser_snapshot or pass a direct media url.',
+      );
+    }
+    const frame = await element.ownerFrame().catch(() => page.mainFrame());
+    return { element, directUrl: null, frame: frame || page.mainFrame() };
+  }
+
+  async media(args = {}) {
+    const operation = args.operation || 'download';
+    const { page, id } = await this.page(args.tab_id);
+    if (this.dialogs.has(page)) {
+      throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is open in this tab.', 'Read browser_snapshot, then call browser_handle_dialog.', { dialog: this.dialogInfo(page) });
+    }
+    if (['download', 'record'].includes(operation) && args.path !== undefined && !isAbsolute(args.path)) {
+      throw new ControlError(
+        'MEDIA_PATH_INVALID',
+        'Media output path must be an absolute local path.',
+        'Use the full path on the machine running the MCP server.',
+      );
+    }
+    if (operation === 'inspect') {
+      const media = [];
+      const warnings = [];
+      for (const [frameIndex, frame] of page.frames().slice(0, 25).entries()) {
+        const frameId = `frame_${frameIndex}`;
+        try {
+          const items = await withDeadline(
+            () => frame.evaluate(collectFrameMedia, { mediaType: args.media_type || 'any' }),
+            frame === page.mainFrame() ? this.config.actionTimeout : 1500,
+          );
+          for (const item of items) {
+            media.push({ ...item, index: media.length, frame_id: frameId });
+          }
+        } catch (error) {
+          if (frame === page.mainFrame()) throw error;
+          warnings.push({ frame_id: frameId, error: error.message });
+        }
+      }
+      return { tab_id: id, url: page.url(), media, ...(warnings.length ? { warnings } : {}) };
+    }
+
+    const { element, directUrl, frame } = await this.resolveMediaTarget(page, args);
+    try {
+      const recordClip = async () => {
+        if (!element) {
+          throw new ControlError(
+            'MEDIA_ELEMENT_REQUIRED',
+            'Recording requires a video or audio element on the page.',
+            'Omit url or pass a video or audio ref from browser_snapshot.',
+          );
+        }
+        const durationMs = args.duration_ms ?? 5000;
+        this.noteInput('media', id);
+        const recorded = await withDeadline(
+          () => element.evaluate(recordElementMedia, {
+            durationMs,
+            maxBytes: MAX_MEDIA_BYTES,
+            playIfPaused: args.play_if_paused !== false,
+            audioOnly: Boolean(args.audio_only),
+          }),
+          Math.max(durationMs + 5000, this.config.actionTimeout),
+        );
+        this.assertActive();
+        if (!recorded?.ok) {
+          throw new ControlError(
+            recorded?.code || 'MEDIA_RECORD_FAILED',
+            recorded?.message || 'Failed to record media stream.',
+            'Ensure the media element can play without cross-origin restrictions, or pass a direct media URL for download.',
+          );
+        }
+        this.outcome.executed = true;
+        const buffer = Buffer.from(recorded.data_base64, 'base64');
+        const outputPath = resolveMediaOutputPath(args.path, recorded.mime_type, '');
+        await writeFile(outputPath, buffer);
+        return {
+          tab_id: id,
+          url: page.url(),
+          method: 'record',
+          path: outputPath,
+          mime_type: recorded.mime_type,
+          bytes: buffer.length,
+          duration_ms: durationMs,
+          current_time: recorded.current_time,
+          duration: recorded.duration,
+        };
+      };
+
+      if (operation === 'control') {
+        if (args.control_action === 'seek' && args.current_time === undefined) {
+          throw new ControlError('MEDIA_ARGUMENTS_INVALID', 'Provide current_time when control_action is "seek".', 'Pass current_time in seconds.');
+        }
+        if (args.control_action === 'rate' && args.playback_rate === undefined) {
+          throw new ControlError('MEDIA_ARGUMENTS_INVALID', 'Provide playback_rate when control_action is "rate".', 'Pass playback_rate (for example 1.5).');
+        }
+        this.noteInput('media', id);
+        const state = await element.evaluate(controlElementMedia, {
+          controlAction: args.control_action,
+          currentTime: args.current_time,
+          muted: args.muted,
+          playbackRate: args.playback_rate,
+        });
+        this.assertActive();
+        this.outcome.executed = true;
+        return { tab_id: id, url: page.url(), executed: true, media: state };
+      }
+
+      if (operation === 'record') {
+        return await recordClip();
+      }
+
+      if (operation === 'download') {
+        const mode = args.mode || 'auto';
+        if (mode === 'record') {
+          return await recordClip();
+        }
+        const meta = element ? await element.evaluate(inspectElementMedia) : null;
+        const mediaUrl = directUrl || meta?.src || '';
+        if (!mediaUrl) {
+          if (element && mode === 'auto') {
+            return await recordClip();
+          }
+          throw new ControlError(
+            'MEDIA_URL_MISSING',
+            'The media element has no downloadable source URL.',
+            'Use operation: "record" to capture live playback from the element.',
+          );
+        }
+        if (mediaUrl.startsWith('data:')) {
+          const { buffer, mimeType } = parseDataUrl(mediaUrl);
+          const outputPath = resolveMediaOutputPath(args.path, mimeType, '');
+          await writeFile(outputPath, buffer);
+          return {
+            tab_id: id,
+            url: page.url(),
+            media_url: mediaUrl.slice(0, 200),
+            method: 'data',
+            path: outputPath,
+            mime_type: mimeType,
+            bytes: buffer.length,
+            ...(meta?.tracks?.length ? { tracks: meta.tracks } : {}),
+          };
+        }
+        if (mediaUrl.startsWith('blob:')) {
+          if (mode === 'fetch') {
+            throw new ControlError(
+              'MEDIA_MODE_INVALID',
+              'Blob URLs can only be fetched inside the browser page or recorded.',
+              'Use mode: "auto", mode: "page", or operation: "record".',
+            );
+          }
+          const pageRes = await (frame || page.mainFrame()).evaluate(fetchMediaInPage, { mediaUrl, maxBytes: MAX_MEDIA_BYTES });
+          this.assertActive();
+          if (pageRes?.ok) {
+            const buffer = Buffer.from(pageRes.data_base64, 'base64');
+            const outputPath = resolveMediaOutputPath(args.path, pageRes.mime_type, mediaUrl);
+            await writeFile(outputPath, buffer);
+            return {
+              tab_id: id,
+              url: page.url(),
+              media_url: mediaUrl,
+              method: 'page',
+              path: outputPath,
+              mime_type: pageRes.mime_type,
+              bytes: buffer.length,
+              ...(meta?.tracks?.length ? { tracks: meta.tracks } : {}),
+            };
+          }
+          if (element && mode === 'auto') {
+            return await recordClip();
+          }
+          if (pageRes?.size_exceeded) {
+            throw new ControlError(
+              'MEDIA_SIZE_LIMIT',
+              'Media file exceeds the 50 MiB download limit.',
+              'Use operation: "record" with a bounded duration_ms to capture a shorter clip.',
+            );
+          }
+          throw new ControlError(
+            'MEDIA_DOWNLOAD_FAILED',
+            pageRes?.error || 'Could not download blob media URL.',
+            'Use operation: "record" to capture MediaSource or live playback.',
+          );
+        }
+
+        let downloadResult;
+        if (mode === 'page' || mode === 'auto') {
+          const pageRes = await (frame || page.mainFrame()).evaluate(fetchMediaInPage, { mediaUrl, maxBytes: MAX_MEDIA_BYTES });
+          this.assertActive();
+          if (pageRes?.ok) {
+            downloadResult = {
+              buffer: Buffer.from(pageRes.data_base64, 'base64'),
+              mimeType: pageRes.mime_type,
+              method: 'page',
+            };
+          } else if (pageRes?.size_exceeded) {
+            throw new ControlError(
+              'MEDIA_SIZE_LIMIT',
+              'Media file exceeds the 50 MiB download limit.',
+              'Use operation: "record" with a bounded duration_ms to capture a shorter clip.',
+            );
+          } else if (mode === 'page') {
+            throw new ControlError(
+              'MEDIA_DOWNLOAD_FAILED',
+              `In-page media fetch failed: ${pageRes?.error || 'unknown error'}`,
+              'Try mode: "auto" or mode: "fetch" for cross-origin media, or operation: "record".',
+            );
+          }
+        }
+        if (!downloadResult) {
+          const nodeRes = await fetchMediaFromNode(mediaUrl, {
+            pageUrl: page.url(),
+            timeoutMs: Math.min(20000, Math.max(2000, this.config.requestTimeout - 2000)),
+          });
+          this.assertActive();
+          downloadResult = { ...nodeRes, method: 'fetch' };
+        }
+        const outputPath = resolveMediaOutputPath(args.path, downloadResult.mimeType, mediaUrl);
+        await writeFile(outputPath, downloadResult.buffer);
+        return {
+          tab_id: id,
+          url: page.url(),
+          media_url: mediaUrl,
+          method: downloadResult.method,
+          path: outputPath,
+          mime_type: downloadResult.mimeType,
+          bytes: downloadResult.buffer.length,
+          ...(meta?.tracks?.length ? { tracks: meta.tracks } : {}),
+        };
+      }
+
+      throw new ControlError('MEDIA_OPERATION_INVALID', `Unknown media operation: ${operation}`, 'Use download, record, inspect, or control.');
+    } finally {
+      release(element);
+    }
   }
 
   async target(ref, page) {
