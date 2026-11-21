@@ -1,3 +1,6 @@
+# Compiled Go binaries
+/bin/chrome-control-mcp
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -5,11 +8,9 @@ build/
 dist/
 wheels/
 *.egg-info
-
-# Virtual environments
 .venv
 
-# Node dependencies
+# Node dependencies (legacy)
 node_modules/
 
 # Screenshots & Media

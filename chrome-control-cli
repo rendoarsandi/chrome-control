@@ -1,3 +1,0 @@
-#!/usr/bin/env node
-// Compatibility entry point: v2 serves MCP over stdio.
-import './bin/chrome-control-mcp.mjs';
