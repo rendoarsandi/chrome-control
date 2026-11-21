@@ -13,6 +13,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import WebSocket, { WebSocketServer } from 'ws';
 import { forwardChrome } from '../src/adb.mjs';
 import { readConfig } from '../src/config.mjs';
+import { diffSnapshots, formatCompactElements } from '../src/dom.mjs';
 import { withDeadline } from '../src/errors.mjs';
 import { createServer } from '../src/server.mjs';
 
@@ -218,6 +219,16 @@ test('MCP discovers tools without Chrome or API keys and gives actionable connec
     assert(tools.some(tool => tool.name === 'browser_pdf'));
     assert(tools.some(tool => tool.name === 'browser_flow'));
     assert(tools.some(tool => tool.name === 'browser_media'));
+    assert(tools.some(tool => tool.name === 'browser_hover'));
+    assert(tools.some(tool => tool.name === 'browser_drag'));
+    assert(tools.some(tool => tool.name === 'browser_forward'));
+    assert(tools.some(tool => tool.name === 'browser_reload'));
+    assert(tools.some(tool => tool.name === 'browser_downloads'));
+    assert(tools.some(tool => tool.name === 'browser_cookies'));
+    const snapTool = tools.find(tool => tool.name === 'browser_snapshot');
+    assert(snapTool.inputSchema.properties.format && snapTool.inputSchema.properties.viewport_only && snapTool.inputSchema.properties.scope && snapTool.inputSchema.properties.filter && snapTool.inputSchema.properties.include_bbox);
+    const shotTool = tools.find(tool => tool.name === 'browser_screenshot');
+    assert(shotTool.inputSchema.properties.annotate);
     const { response, data } = await session.call('browser_status');
     assert.equal(response.isError, true);
     assert.equal(data.error.code, 'CDP_UNAVAILABLE');
@@ -299,6 +310,16 @@ test('ADB only chooses authorized devices and never guesses across multiple devi
   assert.deepEqual(calls[1].args.slice(0, 2), ['-s', 'phone']);
   assert.deepEqual(calls[2].args, ['-s', 'phone', 'forward', 'tcp:9222', 'localabstract:chrome_devtools_remote']);
   await assert.rejects(forwardChrome(config, async () => ({ stdout: 'a\tdevice\nb\tdevice\n' })), error => error.code === 'ADB_DEVICE_REQUIRED');
+  await assert.rejects(
+    forwardChrome(config, async (_cmd, args) => {
+      if (args[0] === 'devices') return { stdout: 'List of devices attached\n' };
+      if (args[0] === 'mdns') return { stdout: 'List of discovered mdns services\nadb-phone\t_adb-tls-connect._tcp.\t192.168.1.55:41234\n' };
+      return { stdout: '' };
+    }),
+    error => error.code === 'ADB_DEVICE_REQUIRED'
+      && error.details?.mdns_services?.[0]?.address === '192.168.1.55:41234'
+      && error.recovery.includes('192.168.1.55:41234'),
+  );
 });
 
 test('ADB passes configuration as arguments, validates timeouts, and bounds requests', async () => {
@@ -1332,5 +1353,338 @@ test('real browser MCP actions, frames, shadow DOM, tab safety and reference lif
     await new Promise(resolve => site.close(resolve));
     await fixture.close();
     await rm(uploadDir, { recursive: true, force: true });
+  }
+});
+
+test('compact snapshots, diffs, Set-of-Marks annotations, challenge handoff, new actions, downloads, cookies, and exec helpers work end-to-end', async () => {
+  // Pure unit checks for compact formatting and snapshot diffs.
+  const compactLine = formatCompactElements([
+    { ref: 's1:e1', role: 'textbox', name: 'Search', value: 'usb-c', focused: true, required: true, in_viewport: true, bbox: { x: 10, y: 20, width: 200, height: 32 } },
+    { ref: 's1:e2', role: 'checkbox', name: 'Agree', checked: true, in_viewport: false },
+  ]);
+  assert.match(compactLine, /\[s1:e1\] textbox "Search" value="usb-c" focused required bbox=10,20,200x32/);
+  assert.match(compactLine, /\[s1:e2\] checkbox "Agree" checked offscreen/);
+
+  const diffChanged = diffSnapshots(
+    { tab_id: 't1', url: 'https://a.test/1', title: 'Step 1', frames: [{ text: 'Hello\nOld line' }], elements: [{ frame_id: 'frame_0', role: 'button', name: 'Next' }] },
+    { tab_id: 't1', url: 'https://a.test/2', title: 'Step 2', frames: [{ text: 'Hello\nSaved successfully' }], elements: [{ ref: 's2:e1', frame_id: 'frame_0', role: 'button', name: 'Done' }] },
+  );
+  assert.deepEqual(diffChanged.url_changed, { from: 'https://a.test/1', to: 'https://a.test/2' });
+  assert.deepEqual(diffChanged.title_changed, { from: 'Step 1', to: 'Step 2' });
+  assert.equal(diffChanged.added_elements[0].name, 'Done');
+  assert.equal(diffChanged.removed_elements, 1);
+  assert.equal(diffChanged.new_text, 'Saved successfully');
+
+  const diffNone = diffSnapshots(
+    { tab_id: 't1', url: 'https://a.test/1', title: 'Same', frames: [{ text: 'Static' }], elements: [{ frame_id: 'frame_0', role: 'button', name: 'Go' }] },
+    { tab_id: 't1', url: 'https://a.test/1', title: 'Same', frames: [{ text: 'Static' }], elements: [{ ref: 's2:e1', frame_id: 'frame_0', role: 'button', name: 'Go' }] },
+  );
+  assert.equal(diffNone.no_visible_change, true);
+
+  const relay = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(resolve => relay.once('listening', resolve));
+  const tempDir = await mkdtemp(join(tmpdir(), 'chrome-control-ux-'));
+  let app;
+  let client;
+  try {
+    const targetInfos = [{ targetId: 'tab-main', type: 'page', title: 'Main Page', url: 'https://ux.test/home' }];
+    let connected = true;
+    let frameText = 'Welcome home';
+    let challenge = null;
+    let annotatedMounted = false;
+    let annotatedUnmounted = false;
+    let pausedClickCovered = false;
+    let eventSession;
+    const actionLog = [];
+    const cookieJar = [
+      { name: 'session', value: 'abc123', domain: 'ux.test', path: '/', httpOnly: true, secure: true, sameSite: 'Lax', session: true },
+    ];
+    let lastCollectLimits = null;
+    let domElements = [
+      { index: 0, tag: 'input', role: 'textbox', name: 'Search', disabled: false, in_viewport: true, value: '', focused: true },
+      { index: 1, tag: 'button', role: 'button', name: 'Open Menu', disabled: false, in_viewport: true, aria_expanded: 'false' },
+      { index: 2, tag: 'div', role: 'option', name: 'Option A', disabled: false, in_viewport: true, aria_selected: 'false' },
+      { index: 3, tag: 'button', role: 'button', name: 'Open Popup', disabled: false, in_viewport: true },
+      { index: 4, tag: 'button', role: 'button', name: 'Download Report', disabled: false, in_viewport: true },
+    ];
+    const makeElementHandle = idx => {
+      const el = {
+        asElement: () => el,
+        ownerFrame: async () => mainFrame,
+        boundingBox: async () => ({ x: 10 + idx * 50, y: 20, width: 40, height: 30 }),
+        evaluate: async (fn, arg) => {
+          const src = fn.toString();
+          if (src.includes('node.isConnected') && !src.includes('requestAnimationFrame') && !src.includes('measure')) return true;
+          if (src.includes('requestAnimationFrame')) return !pausedClickCovered;
+          if (src.includes('describeHit')) {
+            return { ok: false, reason: 'covered', covered_by: { tag: 'div', id: 'cookie-banner', role: 'dialog', text: 'Accept cookies' } };
+          }
+          if (src.includes('scrollIntoView')) return undefined;
+          if (src.includes('type === \'password\'')) return false;
+          return undefined;
+        },
+        click: async opts => {
+          actionLog.push({ type: 'click', idx, opts });
+          if (idx === 3) {
+            targetInfos.push({ targetId: 'tab-popup', type: 'page', title: 'Popup Window', url: 'https://ux.test/popup' });
+          }
+          if (idx === 4) {
+            const fakeDownload = {
+              url: () => 'https://ux.test/report.csv',
+              suggestedFilename: () => 'report.csv',
+              path: async () => join(tempDir, 'tmp-report.csv'),
+              saveAs: async dest => { await writeFile(dest, 'col1,col2\n1,2\n', 'utf8'); },
+            };
+            page.emit('download', fakeDownload);
+          }
+          frameText = `Clicked element ${idx}`;
+        },
+        hover: async () => { actionLog.push({ type: 'hover', idx }); frameText = 'Menu hovered'; },
+        fill: async text => { actionLog.push({ type: 'fill', idx, text }); domElements[idx].value = text; frameText = `Filled ${text}`; },
+        pressSequentially: async text => { actionLog.push({ type: 'pressSequentially', idx, text }); domElements[idx].value = text; frameText = `Typed ${text}`; },
+        press: async key => { actionLog.push({ type: 'press', idx, key }); frameText += ` + ${key}`; },
+        selectOption: async values => { actionLog.push({ type: 'select', idx, values }); },
+        dispose: async () => {},
+      };
+      return el;
+    };
+    const makeDomHandle = data => ({
+      getProperty: async key => {
+        if (key === 'data') return { jsonValue: async () => data, dispose: async () => {} };
+        if (key === 'nodes') {
+          return {
+            getProperty: async idx => makeElementHandle(Number(idx)),
+            evaluate: async (fn, arg) => {
+              if (fn.name === 'mountAnnotations') { annotatedMounted = true; return arg.length; }
+              return data.stamp;
+            },
+            dispose: async () => {},
+          };
+        }
+        return { dispose: async () => {} };
+      },
+      dispose: async () => {},
+    });
+    const mainFrame = {
+      url: () => targetInfos[0].url,
+      name: () => '',
+      isDetached: () => false,
+      evaluate: async fn => {
+        if (fn.name === 'unmountAnnotations') annotatedUnmounted = true;
+        return null;
+      },
+      evaluateHandle: async (_fn, limits) => {
+        lastCollectLimits = limits;
+        const filtered = domElements.filter(el => {
+          if (limits.roles?.length && !limits.roles.includes(el.role)) return false;
+          if (limits.filter && !el.name.toLowerCase().includes(limits.filter.toLowerCase())) return false;
+          return true;
+        });
+        return makeDomHandle({
+          stamp: `stamp-${actionLog.length}-${frameText}`,
+          title: targetInfos[0].title,
+          text: frameText,
+          text_truncated: false,
+          elements: filtered,
+          elements_truncated: false,
+          ...(limits.scope ? { scope_matched: limits.scope === 'main' } : {}),
+          ...(challenge ? { challenge } : {}),
+        });
+      },
+    };
+    const mouseMoves = [];
+    const page = Object.assign(new EventEmitter(), {
+      isClosed: () => false,
+      context: () => context,
+      url: () => targetInfos[0].url,
+      title: async () => targetInfos[0].title,
+      frames: () => [mainFrame],
+      mainFrame: () => mainFrame,
+      waitForTimeout: async () => {},
+      goForward: async () => { actionLog.push({ type: 'forward' }); targetInfos[0].url = 'https://ux.test/next'; },
+      reload: async () => { actionLog.push({ type: 'reload' }); frameText = 'Reloaded page'; },
+      screenshot: async () => Buffer.from('FAKE-JPEG'),
+      mouse: {
+        move: async (x, y, opts) => mouseMoves.push({ op: 'move', x, y, opts }),
+        down: async () => mouseMoves.push({ op: 'down' }),
+        up: async () => mouseMoves.push({ op: 'up' }),
+        click: async (x, y, opts) => mouseMoves.push({ op: 'click', x, y, opts }),
+      },
+      keyboard: {
+        press: async key => actionLog.push({ type: 'key', key }),
+        down: async () => {},
+        up: async () => {},
+      },
+    });
+    const context = {
+      setDefaultTimeout: () => {},
+      pages: () => [page],
+      newCDPSession: async () => {
+        const session = Object.assign(new EventEmitter(), {
+          send: async (method, params = {}) => {
+            if (method === 'Target.getTargetInfo') return { targetInfo: targetInfos[0] };
+            if (method === 'Network.enable') { eventSession = session; return {}; }
+            if (method === 'Runtime.enable' || method === 'Page.enable') return {};
+            if (method === 'Network.getCookies') return { cookies: [...cookieJar] };
+            if (method === 'Network.setCookie') { cookieJar.push({ ...params, domain: params.domain || 'ux.test', path: params.path || '/' }); return { success: true }; }
+            if (method === 'Network.deleteCookies') {
+              for (let i = cookieJar.length - 1; i >= 0; i--) if (cookieJar[i].name === params.name) cookieJar.splice(i, 1);
+              return {};
+            }
+            if (method === 'Network.clearBrowserCookies') { cookieJar.length = 0; return {}; }
+            return {};
+          },
+          detach: async () => {},
+        });
+        return session;
+      },
+    };
+    const fakeChromium = {
+      connectOverCDP: async transport => {
+        transport.onclose = () => { connected = false; };
+        return {
+          isConnected: () => connected,
+          contexts: () => [context],
+          newBrowserCDPSession: async () => ({
+            send: async method => (method === 'Target.getTargets' ? { targetInfos: [...targetInfos] } : {}),
+            detach: async () => {},
+          }),
+          close: async () => { connected = false; transport.close(); },
+        };
+      },
+    };
+    app = createServer(fakeChromium, readConfig({ CHROME_CDP_URL: `ws://127.0.0.1:${relay.address().port}`, CHROME_AUTO_ADB: '0' }));
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    client = new Client({ name: 'chrome-control-ux-tests', version: '1.0.0' });
+    await Promise.all([app.server.connect(serverTransport), client.connect(clientTransport)]);
+    const call = async (name, args = {}) => {
+      const response = await client.callTool({ name, arguments: args });
+      return { response, data: JSON.parse(response.content.find(item => item.type === 'text').text) };
+    };
+
+    // 1. Compact & filtered snapshots + scope warning + passive challenge detection.
+    const compactSnap = await call('browser_snapshot', { format: 'compact', viewport_only: true, scope: 'main', filter: 'option', roles: ['option'], include_bbox: true });
+    assert.equal(compactSnap.data.ok, true, JSON.stringify(compactSnap.data));
+    assert.equal(compactSnap.data.format, 'compact');
+    assert.equal(compactSnap.data.element_count, 1);
+    assert.match(compactSnap.data.elements_text, /option "Option A"/);
+    assert.equal(lastCollectLimits.viewportOnly, true);
+    assert.equal(lastCollectLimits.scope, 'main');
+    assert.equal(lastCollectLimits.includeBbox, true);
+
+    const missingScope = await call('browser_snapshot', { scope: '#does-not-exist' });
+    assert(missingScope.data.warnings?.some(w => w.code === 'SCOPE_NOT_FOUND'));
+
+    challenge = { kind: 'turnstile', reason: 'Detected a Cloudflare verification challenge.' };
+    const challengeSnap = await call('browser_snapshot');
+    assert.equal(challengeSnap.data.human_interaction_required.kind, 'turnstile');
+    assert.match(challengeSnap.data.human_interaction_required.recovery, /Human verification/i);
+    challenge = null;
+
+    // 2. Set-of-Marks annotated screenshot mounts and cleans up overlay.
+    const fullSnap = await call('browser_snapshot');
+    const annotated = await call('browser_screenshot', { annotate: true });
+    assert.equal(annotated.data.ok, true);
+    assert.equal(annotated.data.annotated, true);
+    assert.equal(annotated.data.annotated_count, 5);
+    assert.equal(annotated.data.snapshot_id, fullSnap.data.snapshot_id);
+    assert.equal(annotatedMounted, true);
+    assert.equal(annotatedUnmounted, true);
+    assert(annotated.response.content.some(item => item.type === 'image'));
+
+    // 3. Hover, fill with slowly + press_enter, click with modifiers/click_count + changes diff.
+    const hoverRes = await call('browser_hover', { ref: fullSnap.data.elements[1].ref });
+    assert.equal(hoverRes.data.ok, true);
+    assert.equal(hoverRes.data.changes.new_text, 'Menu hovered');
+
+    const fillRes = await call('browser_fill', { ref: hoverRes.data.snapshot.elements[0].ref, text: 'termux', slowly: true, press_enter: true });
+    assert.equal(fillRes.data.ok, true);
+    assert(actionLog.some(e => e.type === 'pressSequentially' && e.text === 'termux'));
+    assert(actionLog.some(e => e.type === 'press' && e.key === 'Enter'));
+
+    const dblClick = await call('browser_click', { ref: fillRes.data.snapshot.elements[2].ref, button: 'right', click_count: 2, modifiers: ['Shift'] });
+    assert.equal(dblClick.data.ok, true);
+    assert(actionLog.some(e => e.type === 'click' && e.opts.button === 'right' && e.opts.clickCount === 2 && e.opts.modifiers[0] === 'Shift'));
+
+    // 4. Covering element details on ELEMENT_NOT_ACTIONABLE.
+    pausedClickCovered = true;
+    const blockedClick = await call('browser_click', { ref: dblClick.data.snapshot.elements[1].ref });
+    assert.equal(blockedClick.response.isError, true);
+    assert.equal(blockedClick.data.error.code, 'ELEMENT_NOT_ACTIONABLE');
+    assert.equal(blockedClick.data.error.details.covered_by.id, 'cookie-banner');
+    assert.match(blockedClick.data.error.message, /Accept cookies/);
+    pausedClickCovered = false;
+
+    // 5. Popup detection (new_tabs) & download capture (downloads + browser_downloads).
+    let fresh = (await call('browser_snapshot')).data;
+    const popupClick = await call('browser_click', { ref: fresh.elements[3].ref });
+    assert.equal(popupClick.data.ok, true);
+    assert.equal(popupClick.data.new_tabs.length, 1);
+    assert.equal(popupClick.data.new_tabs[0].title, 'Popup Window');
+
+    // Select main tab again and trigger a download.
+    fresh = (await call('browser_snapshot')).data;
+    const dlClick = await call('browser_click', { ref: fresh.elements[4].ref });
+    assert.equal(dlClick.data.ok, true);
+    assert.equal(dlClick.data.downloads.length, 1);
+    assert.equal(dlClick.data.downloads[0].suggested_filename, 'report.csv');
+
+    const listedDl = await call('browser_downloads', { operation: 'list' });
+    assert.equal(listedDl.data.downloads.length, 1);
+    const savedDlPath = join(tempDir, 'saved-report.csv');
+    const savedDl = await call('browser_downloads', { operation: 'save', path: savedDlPath });
+    assert.equal(savedDl.data.saved, true);
+    assert.equal(await readFile(savedDlPath, 'utf8'), 'col1,col2\n1,2\n');
+
+    // 6. Drag (element-to-element, pixel offset, and missing target error).
+    fresh = (await call('browser_snapshot')).data;
+    const dragErr = await call('browser_drag', { source_ref: fresh.elements[0].ref });
+    assert.equal(dragErr.response.isError, true);
+    assert.equal(dragErr.data.error.code, 'DRAG_TARGET_REQUIRED');
+
+    fresh = (await call('browser_snapshot')).data;
+    const dragOk = await call('browser_drag', { source_ref: fresh.elements[0].ref, target_ref: fresh.elements[2].ref, steps: 4 });
+    assert.equal(dragOk.data.ok, true);
+    assert(mouseMoves.some(m => m.op === 'down') && mouseMoves.some(m => m.op === 'up'));
+
+    // 7. Forward, reload, and wait_for network_idle.
+    const fwd = await call('browser_forward', { wait_for: { network_idle: true, idle_ms: 100, timeout_ms: 1000 } });
+    assert.equal(fwd.data.ok, true);
+    assert.equal(fwd.data.wait.matched, true);
+    assert.equal(fwd.data.changes.url_changed.to, 'https://ux.test/next');
+    const rel = await call('browser_reload');
+    assert.equal(rel.data.ok, true);
+    assert(actionLog.some(e => e.type === 'reload'));
+
+    // 8. Cookies (get, set, delete, clear).
+    const gotCookies = await call('browser_cookies', { operation: 'get' });
+    assert.equal(gotCookies.data.cookies[0].name, 'session');
+    assert.equal(gotCookies.data.cookies[0].http_only, true);
+    await call('browser_cookies', { operation: 'set', name: 'theme', value: 'dark' });
+    assert.equal((await call('browser_cookies', { operation: 'get', name: 'theme' })).data.cookies[0].value, 'dark');
+    await call('browser_cookies', { operation: 'delete', name: 'theme' });
+    assert.equal((await call('browser_cookies', { operation: 'get', name: 'theme' })).data.cookies.length, 0);
+    await call('browser_cookies', { operation: 'clear' });
+    assert.equal((await call('browser_cookies', { operation: 'get' })).data.cookies.length, 0);
+
+    // 9. Built-in ergonomic exec helpers: find_element, find_elements, click_text, fill_label.
+    const execUx = await call('browser_exec', {
+      include_snapshot: false,
+      code: [
+        'var opts = await find_elements("option");',
+        'var btn = await find_element("Open Menu");',
+        'await fill_label("Search", "hello", { press_enter: true });',
+        'await click_text("Option A");',
+        '({ optCount: opts.length, btnName: btn.name });',
+      ].join('\n'),
+    });
+    assert.equal(execUx.data.ok, true, JSON.stringify(execUx.data));
+    assert.deepEqual(execUx.data.result, { optCount: 1, btnName: 'Open Menu' });
+  } finally {
+    await client?.close();
+    await app?.close();
+    for (const socket of relay.clients) socket.terminate();
+    await new Promise(resolve => relay.close(resolve));
+    await rm(tempDir, { recursive: true, force: true });
   }
 });

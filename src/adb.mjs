@@ -26,10 +26,30 @@ export async function forwardChrome(config, run = execute, { signal, reconnect =
       const devices = output.split(/\r?\n/).map(line => line.trim().split(/\s+/))
         .filter(parts => parts[1] === 'device').map(parts => parts[0]);
       if (devices.length !== 1) {
+        let mdnsServices;
+        if (devices.length === 0) {
+          try {
+            const mdnsOut = (await run('adb', ['mdns', 'services'], { timeout: 1500, maxBuffer: 64 * 1024, ...(signal ? { signal } : {}) })).stdout || '';
+            const parsed = mdnsOut.split(/\r?\n/)
+              .map(line => line.trim())
+              .filter(line => line && !/^list of discovered/i.test(line))
+              .map(line => {
+                const parts = line.split(/\s+/);
+                const address = parts.find(part => /^(?:\[[\da-f:]+\]|[\w.-]+):\d{1,5}$/i.test(part));
+                return address ? { name: parts[0], type: parts[1] || '', address } : null;
+              })
+              .filter(Boolean);
+            if (parsed.length) mdnsServices = parsed;
+          } catch {}
+        }
         throw new ControlError('ADB_DEVICE_REQUIRED',
           devices.length ? 'Multiple authorized ADB devices are connected.' : 'No authorized ADB device is connected.',
-          devices.length ? 'Set ANDROID_SERIAL to the intended device serial from adb devices.' : 'Pair and connect wireless debugging, then check adb devices. See the README Termux setup.',
-          { devices });
+          devices.length
+            ? 'Set ANDROID_SERIAL to the intended device serial from adb devices.'
+            : mdnsServices?.length
+              ? `Discovered wireless ADB services via mDNS. Call browser_status with android_serial set to the connect address (e.g. "${mdnsServices[0].address}").`
+              : 'Pair and connect wireless debugging, then check adb devices. See the README Termux setup.',
+          { devices, ...(mdnsServices ? { mdns_services: mdnsServices } : {}) });
       }
       [serial] = devices;
     }

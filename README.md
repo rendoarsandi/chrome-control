@@ -136,7 +136,9 @@ browser_batch({
 
 The server retains the actual nodes before starting, checks them before each action, and returns one final snapshot. It stops on navigation, a popup, a dialog, a file chooser, a changed or detached target, a failure, or its time budget. Inspect `completed`, `results`, and `stopped`; completed actions are not rolled back or repeated. Batch only steps whose targets and purpose are already known. After a page change, inspect the returned snapshot before planning another batch.
 
-All ordinary actions also accept `wait_for` with literal `text`, `text_absent`, `url` substring conditions, or a CSS `selector` with `state: "attached"`, `"visible"`, `"hidden"` or `"enabled"`. All supplied conditions must match. Set a current `frame_id` to observe an iframe; otherwise matching inspects the main frame. Selectors only observe readiness; input still uses exact refs. The timeout is at most five seconds. A timeout returns `wait.matched: false` alongside the executed action and its snapshot. `include_screenshot` adds a viewport image to the same tool result.
+All ordinary actions also accept `wait_for` with literal `text`, `text_absent` (including open shadow DOM), `url` substring conditions, a CSS `selector` with `state: "attached"`, `"visible"`, `"hidden"` or `"enabled"`, or `network_idle: true`. All supplied conditions must match. Set a current `frame_id` to observe an iframe; otherwise matching inspects the main frame. Selectors only observe readiness; input still uses exact refs. The timeout is up to 15 seconds (bounded by the request deadline). A timeout returns `wait.matched: false` alongside the executed action and its snapshot. `include_screenshot` adds a viewport image to the same tool result, and `annotate_screenshot: true` overlays numbered Set-of-Marks badges (`e1`, `e2`, ...) matching the snapshot refs.
+
+Action responses include a compact `changes` diff summary (`url_changed`, `title_changed`, `added_elements`, `removed_elements`, `new_text`, or `no_visible_change`), `new_tabs` when a click opens a popup or `target="_blank"` tab, and `downloads` when a file download starts. When a verification/CAPTCHA widget is detected, snapshots include `human_interaction_required` so the assistant pauses and asks the user to complete it directly in Chrome.
 
 For file uploads, use a `file_input` ref from the latest snapshot, including a hidden input in an iframe:
 
@@ -157,17 +159,20 @@ References retain actual DOM nodes. A layout change cannot silently turn an old 
 | `browser_select_tab` | Select and foreground a tab, return a snapshot |
 | `browser_new_tab`, `browser_close_tab` | Open or explicitly close a tab |
 | `browser_handle_dialog` | Accept or dismiss a JavaScript alert, confirmation or prompt |
-| `browser_snapshot` | Read bounded page text and interactive elements (`mode: "dom"`), Playwright accessibility tree (`"aria"`), or `"both"` |
-| `browser_click`, `browser_fill` | Click or replace input text using a current reference |
+| `browser_snapshot` | Read bounded page text and interactive elements (`mode: "dom"`), accessibility tree (`"aria"`), or `"both"`. Supports `format: "compact"`, `viewport_only`, `scope`, `filter`, `roles`, and `include_bbox` |
+| `browser_click`, `browser_hover`, `browser_fill` | Click (supports `button`, `click_count`, `modifiers`), hover, or fill (`press_enter`, `slowly`) using a current reference |
+| `browser_drag` | Drag between two element refs or by pixel offset `(dx, dy)` |
 | `browser_batch` | Perform a guarded sequence of known actions and observe once |
-| `browser_exec` | Run persistent JavaScript with browser helpers, conditions and loops in one MCP call |
+| `browser_exec` | Run persistent JavaScript with browser helpers (`find_element`, `find_elements`, `click_text`, `fill_label`, etc.), conditions and loops in one MCP call |
 | `browser_upload` | Attach local files through a file input or intercepted chooser |
-| `browser_select` | Select native dropdown options by value |
+| `browser_downloads` | List captured file downloads or save a download to an explicit local path |
+| `browser_cookies` | Inspect, set, delete, or clear cookies via CDP (including `HttpOnly`) |
+| `browser_select` | Select native dropdown options by value or visible label |
 | `browser_press` | Press Enter, Tab, shortcuts, etc. |
 | `browser_scroll` | Scroll the viewport or a referenced container |
-| `browser_navigate`, `browser_back` | Navigate a selected tab |
-| `browser_wait` | Wait up to five seconds and observe again |
-| `browser_screenshot` | Viewport, full page or element JPEG; optional longest-edge limit |
+| `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload` | Navigate, traverse history, or reload a selected tab |
+| `browser_wait` | Wait for `wait_for` conditions or briefly observe again |
+| `browser_screenshot` | Viewport, full page or element JPEG; optional `annotate: true` Set-of-Marks badges and `max_dim` limit |
 | `browser_tap` | Click viewport CSS pixel coordinates for canvas or visual controls |
 | `browser_evaluate` | JavaScript fallback with a result and fresh snapshot |
 | `browser_console_messages` | Watch or drain console logs and uncaught exceptions on the selected tab |

@@ -3,7 +3,15 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, extname, isAbsolute } from 'node:path';
 import { canForward, forwardChrome } from './adb.mjs';
 import { connectTransport } from './cdp-transport.mjs';
-import { collectDOM, observationStamp, scrollDOM } from './dom.mjs';
+import {
+  collectDOM,
+  diffSnapshots,
+  formatCompactElements,
+  mountAnnotations,
+  observationStamp,
+  scrollDOM,
+  unmountAnnotations,
+} from './dom.mjs';
 import { ControlError, describeError, withDeadline } from './errors.mjs';
 import { PageEvents } from './events.mjs';
 import { FlowCapture, FlowStore } from './flow.mjs';
@@ -22,6 +30,19 @@ import {
 
 // Handle release is housekeeping, never a prerequisite for the next request.
 const release = handle => { handle?.dispose().catch(() => {}); };
+const DEFAULT_SNAPSHOT_KEY = JSON.stringify({ viewport_only: false, scope: null, filter: null, roles: null, include_bbox: false, format: 'json' });
+const UPLOAD_MIME_TYPES = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.ico': 'image/x-icon',
+  '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.csv': 'text/csv',
+  '.json': 'application/json', '.xml': 'application/xml', '.html': 'text/html', '.htm': 'text/html',
+  '.rtf': 'application/rtf', '.zip': 'application/zip', '.gz': 'application/gzip', '.tar': 'application/x-tar',
+  '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4',
+  '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
+};
 const identity = node => JSON.stringify({
   tag: node.tagName, type: node.getAttribute('type'), label: node.getAttribute('aria-label'),
   text: ['BUTTON', 'A', 'SUMMARY'].includes(node.tagName) || node.getAttribute('role') === 'button' ? node.textContent : null,
@@ -37,6 +58,7 @@ export class BrowserController {
     this.pages = new Map();
     this.dialogs = new Map();
     this.fileChoosers = new Map();
+    this.downloads = new Map();
     this.refs = new Map();
     this.handles = [];
     this.sequence = 0;
@@ -53,6 +75,8 @@ export class BrowserController {
     this.transport = null;
     this.outcome = {};
     this.lastSnapshot = null;
+    this.lastSnapshotByTab = new Map();
+    this.snapshotFilterKey = DEFAULT_SNAPSHOT_KEY;
     this.snapshotFrames = [];
     this.snapshotCount = 0;
     this.eventStreams = new Map();
@@ -80,6 +104,8 @@ export class BrowserController {
     this.pages.clear();
     this.dialogs.clear();
     this.fileChoosers.clear();
+    this.downloads.clear();
+    this.lastSnapshotByTab.clear();
     this.targets.clear();
     this.titles.clear();
     this.tabInfo = new Map();
@@ -173,6 +199,8 @@ export class BrowserController {
     this.dialogs.clear();
     for (const chooser of this.fileChoosers.values()) release(chooser.element());
     this.fileChoosers.clear();
+    this.downloads.clear();
+    this.lastSnapshotByTab.clear();
     this.targets.clear();
     this.titles.clear();
     this.tabInfo?.clear();
@@ -197,8 +225,28 @@ export class BrowserController {
     this.pages.set(id, page);
     this.targets.set(page, targetId);
     page.on('dialog', dialog => this.dialogs.set(page, dialog));
+    page.on('download', download => {
+      const list = this.downloads.get(page) || [];
+      const record = {
+        download_id: `dl_${this.prefix}_${++this.sequence}`,
+        tab_id: id,
+        url: download.url(),
+        suggested_filename: download.suggestedFilename(),
+        status: 'pending',
+        created_at: Date.now(),
+        download,
+      };
+      list.push(record);
+      while (list.length > 20) list.shift();
+      this.downloads.set(page, list);
+      download.path().then(
+        filePath => { record.path = filePath; record.status = 'completed'; },
+        error => { record.status = 'failed'; record.error = error?.message || String(error); },
+      );
+    });
     page.on('close', () => {
-      this.dialogs.delete(page); this.fileChoosers.delete(page);
+      this.dialogs.delete(page); this.fileChoosers.delete(page); this.downloads.delete(page);
+      this.lastSnapshotByTab.delete(id);
       this.eventStreams.get(page)?.close(); this.eventStreams.delete(page);
       this.flowCaptures.get(page)?.close(); this.flowCaptures.delete(page);
       this.routes.delete(page);
@@ -373,7 +421,18 @@ export class BrowserController {
     }
   }
 
-  async snapshot({ tab_id, max_elements = 160, max_text = 12000, mode = 'dom' } = {}) {
+  async snapshot({
+    tab_id,
+    max_elements = 160,
+    max_text = 12000,
+    mode = 'dom',
+    format = 'json',
+    viewport_only = false,
+    scope,
+    filter,
+    roles,
+    include_bbox = false,
+  } = {}) {
     const { page, id } = await this.page(tab_id);
     this.snapshotCount++;
     if (this.dialogs.has(page)) {
@@ -401,6 +460,14 @@ export class BrowserController {
         frames: [], elements: [],
       };
     }
+    const filterKey = JSON.stringify({
+      viewport_only: Boolean(viewport_only),
+      scope: scope || null,
+      filter: filter || null,
+      roles: roles?.length ? roles : null,
+      include_bbox: Boolean(include_bbox),
+      format,
+    });
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.clearRefs();
       const snapshotId = `snapshot_${this.prefix}_${++this.sequence}`;
@@ -411,6 +478,8 @@ export class BrowserController {
       const pageFrames = page.frames();
       const elements = [];
       let title = this.titles.get(page) || '(loading)';
+      let challenge = null;
+      let anyScopeMatched = !scope;
       const until = Date.now() + Math.min(this.config.actionTimeout, this.config.requestTimeout - 1000);
       let retry = false;
       for (const [index, frame] of pageFrames.slice(0, 25).entries()) {
@@ -422,18 +491,31 @@ export class BrowserController {
         }
         try {
           const { handle, nodes, data } = await this.readFrame(frame,
-            { maxElements: remainingElements, maxText: remainingText },
+            {
+              maxElements: remainingElements,
+              maxText: remainingText,
+              viewportOnly: Boolean(viewport_only),
+              scope: scope || null,
+              filter: filter || null,
+              roles: roles?.length ? roles : null,
+              includeBbox: Boolean(include_bbox),
+            },
             Math.max(1, Math.min(remaining, frame === page.mainFrame() ? this.config.actionTimeout : 1500)));
           this.assertActive();
           this.handles.push(handle, nodes);
-          this.snapshotFrames.push({ frame, nodes, stamp: data.stamp });
+          if (data.scope_matched !== false) anyScopeMatched = true;
+          if (!challenge && data.challenge) challenge = { ...data.challenge, frame_id: frameId };
+          const frameLabels = [];
           if (frame === page.mainFrame()) { title = data.title; this.titles.set(page, title); }
           for (const item of data.elements) {
-            const ref = `${snapshotId}:e${elements.length + 1}`;
+            const shortId = `e${elements.length + 1}`;
+            const ref = `${snapshotId}:${shortId}`;
             this.refs.set(ref, { nodes, index: item.index, page, tabId: id });
+            frameLabels.push(shortId);
             const { index: nodeIndex, ...description } = item;
             elements.push({ ref, frame_id: frameId, ...description });
           }
+          this.snapshotFrames.push({ frame, nodes, stamp: data.stamp, labels: frameLabels });
           frames.push({ frame_id: frameId, url: frame.url(), name: frame.name(), text: data.text, text_truncated: data.text_truncated, elements_truncated: data.elements_truncated });
           remainingElements -= data.elements.length;
           remainingText -= data.text.length;
@@ -454,6 +536,9 @@ export class BrowserController {
         await page.waitForLoadState('domcontentloaded', { timeout: 1500 }).catch(() => {});
         continue;
       }
+      if (scope && !anyScopeMatched) {
+        warnings.push({ code: 'SCOPE_NOT_FOUND', message: `No element matched scope selector "${scope}".` });
+      }
       if (pageFrames.length > 25) warnings.push({ message: 'Only the first 25 frames were inspected.' });
       let ariaFields = {};
       if (mode === 'both') {
@@ -471,19 +556,41 @@ export class BrowserController {
         }
       }
       const savedFlows = await this.flowStore.hintsForUrl(page.url());
-      return this.lastSnapshot = {
+      const humanInteraction = challenge ? {
+        ...challenge,
+        recovery: 'Human verification is required. Pause automation, ask the user to complete this challenge directly in Chrome, and then call browser_snapshot to resume.',
+      } : null;
+      const baseRecord = {
         tab_id: id, snapshot_id: snapshotId, ...(mode === 'both' ? { mode } : {}), url: page.url(), title,
-        frames, elements, ...ariaFields,
+        frames, ...ariaFields,
         ...(savedFlows.length ? { saved_flows: savedFlows } : {}),
+        ...(humanInteraction ? { human_interaction_required: humanInteraction } : {}),
         ...(warnings.length ? { warnings } : {}),
+      };
+      this.snapshotFilterKey = filterKey;
+      const fullRecord = {
+        ...baseRecord,
+        elements,
         reference_help: 'Use ref values from this snapshot. A new snapshot or action invalidates earlier references. Offscreen elements are scrolled into view during interaction.',
       };
+      this.lastSnapshotByTab.set(id, fullRecord);
+      if (format === 'compact') {
+        const compactRecord = {
+          ...baseRecord,
+          format: 'compact',
+          element_count: elements.length,
+          elements_text: formatCompactElements(elements),
+        };
+        this.lastSnapshot = compactRecord;
+        return compactRecord;
+      }
+      return this.lastSnapshot = fullRecord;
     }
   }
 
   async currentSnapshot(tabId) {
     const cached = this.lastSnapshot;
-    if (!cached) return null;
+    if (!cached || this.snapshotFilterKey !== DEFAULT_SNAPSHOT_KEY) return null;
     const { page, id } = await this.page(tabId);
     if (cached.tab_id !== id || cached.url !== page.url()) return null;
     if (cached.dialog) return this.dialogs.has(page) ? cached : null;
@@ -1069,29 +1176,35 @@ export class BrowserController {
     }
   }
 
-  async click(page, target, timeout) {
-    // Android may suspend rendering while CDP evaluation and timers still work.
-    // Detect this before sending input; never retry a click that may have executed.
-    const framesRunning = await target.evaluate(() => new Promise(resolve => {
+  async isRenderingRunning(target) {
+    return target.evaluate(() => new Promise(resolve => {
       const frame = requestAnimationFrame(() => { clearTimeout(timer); resolve(true); });
       const timer = setTimeout(() => { cancelAnimationFrame(frame); resolve(false); }, 150);
     }));
-    if (framesRunning) {
-      this.noteInput('click', this.register(page));
-      return target.click({ timeout, noWaitAfter: true });
-    }
-    // Sample geometry using timers instead of animation frames. Only send native
-    // mouse input when the same retained node is visible, enabled and uncovered.
-    const point = await target.evaluate(async node => {
+  }
+
+  async resolvePausedPoint(page, target) {
+    // Sample geometry using timers instead of animation frames. Only return
+    // coordinates when the same retained node is visible, enabled and uncovered.
+    const measured = await target.evaluate(async node => {
       node.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+      const describeHit = hit => hit ? {
+        tag: hit.tagName.toLowerCase(),
+        ...(hit.id ? { id: hit.id } : {}),
+        ...(hit.getAttribute?.('role') ? { role: hit.getAttribute('role') } : {}),
+        ...((hit.innerText || hit.getAttribute?.('aria-label') || '').trim()
+          ? { text: (hit.innerText || hit.getAttribute?.('aria-label') || '').trim().slice(0, 120) }
+          : {}),
+      } : undefined;
       const measure = () => {
-        if (!node.isConnected || node.matches(':disabled') || node.closest('[aria-disabled="true"], [inert]')) return null;
-        if (!node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return null;
+        if (!node.isConnected) return { ok: false, reason: 'detached' };
+        if (node.matches(':disabled') || node.closest('[aria-disabled="true"], [inert]')) return { ok: false, reason: 'disabled' };
+        if (node.checkVisibility && !node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return { ok: false, reason: 'hidden' };
         const box = node.getBoundingClientRect();
-        if (box.width <= 0 || box.height <= 0) return null;
+        if (box.width <= 0 || box.height <= 0) return { ok: false, reason: 'zero_size' };
         const left = Math.max(0, box.left), right = Math.min(innerWidth, box.right);
         const top = Math.max(0, box.top), bottom = Math.min(innerHeight, box.bottom);
-        if (right <= left || bottom <= top) return null;
+        if (right <= left || bottom <= top) return { ok: false, reason: 'outside_viewport' };
         const x = (left + right) / 2, y = (top + bottom) / 2;
         let hit = document.elementFromPoint(x, y);
         while (hit?.shadowRoot) {
@@ -1099,30 +1212,36 @@ export class BrowserController {
           if (!child || child === hit) break;
           hit = child;
         }
-        if (!hit || !(hit === node || node.contains(hit))) return null;
-        return { x, y, left: box.left, top: box.top, width: box.width, height: box.height };
+        if (!hit || !(hit === node || node.contains(hit))) return { ok: false, reason: 'covered', covered_by: describeHit(hit) };
+        return { ok: true, x, y, left: box.left, top: box.top, width: box.width, height: box.height };
       };
       const first = measure();
-      if (!first) return null;
+      if (!first.ok) return first;
       await new Promise(resolve => setTimeout(resolve, 75));
       const second = measure();
-      return second && Object.keys(first).every(key => first[key] === second[key]) ? second : null;
+      if (!second.ok) return second;
+      const stable = ['x', 'y', 'left', 'top', 'width', 'height'].every(key => first[key] === second[key]);
+      return stable ? second : { ok: false, reason: 'moving' };
     });
-    if (!point) {
-      throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'The target is hidden, disabled, covered or moving while Chrome rendering is paused.',
-        'Bring Chrome to the foreground and keep the screen unlocked. Inspect a fresh snapshot or screenshot before trying again.');
+    if (!measured?.ok) {
+      const covered = measured?.covered_by;
+      const reason = covered
+        ? `The target is covered by <${covered.tag}${covered.role ? ` role="${covered.role}"` : ''}>${covered.text ? ` ("${covered.text}")` : ''} while Chrome rendering is paused.`
+        : 'The target is hidden, disabled, covered or moving while Chrome rendering is paused.';
+      throw new ControlError('ELEMENT_NOT_ACTIONABLE', reason,
+        covered
+          ? 'Dismiss or scroll past the covering element, then inspect a fresh snapshot before trying again.'
+          : 'Bring Chrome to the foreground and keep the screen unlocked. Inspect a fresh snapshot or screenshot before trying again.',
+        { ...(measured?.reason ? { reason: measured.reason } : {}), ...(covered ? { covered_by: covered } : {}) });
     }
-    let nativePoint = point;
+    let nativePoint = measured;
     const frame = await target.ownerFrame();
     if (frame !== page.mainFrame()) {
-      // Playwright's CDP bounding box is expressed in the top-level viewport.
-      // Check every ancestor frame at that exact point, not at its center:
-      // an overlay may cover only the part containing the requested control.
       const box = await target.boundingBox();
-      if (!box || Math.abs(box.width - point.width) > 0.5 || Math.abs(box.height - point.height) > 0.5) {
+      if (!box || Math.abs(box.width - measured.width) > 0.5 || Math.abs(box.height - measured.height) > 0.5) {
         throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'Cannot safely map this paused frame into viewport coordinates.', 'Keep Chrome foregrounded and inspect a fresh screenshot. Transformed frames require visual interaction.');
       }
-      nativePoint = { x: box.x + point.x - point.left, y: box.y + point.y - point.top };
+      nativePoint = { x: box.x + measured.x - measured.left, y: box.y + measured.y - measured.top };
       for (let current = frame; current?.parentFrame(); current = current.parentFrame()) {
         const parent = current.parentFrame();
         const host = await current.frameElement();
@@ -1138,30 +1257,196 @@ export class BrowserController {
             }
             origin = { x: bounds.x + geometry.left, y: bounds.y + geometry.top };
           }
-          const uncovered = await host.evaluate((node, point) => {
-            if (!node.isConnected || getComputedStyle(node).transform !== 'none' || point.x < 0 || point.y < 0 || point.x >= innerWidth || point.y >= innerHeight) return false;
+          const check = await host.evaluate((node, point) => {
+            if (!node.isConnected || getComputedStyle(node).transform !== 'none' || point.x < 0 || point.y < 0 || point.x >= innerWidth || point.y >= innerHeight) {
+              return { uncovered: false };
+            }
             let hit = document.elementFromPoint(point.x, point.y);
             while (hit?.shadowRoot) {
               const next = hit.shadowRoot.elementFromPoint(point.x, point.y);
               if (!next || next === hit) break;
               hit = next;
             }
-            return hit === node;
+            if (hit === node) return { uncovered: true };
+            return {
+              uncovered: false,
+              covered_by: hit ? {
+                tag: hit.tagName.toLowerCase(),
+                ...(hit.id ? { id: hit.id } : {}),
+                ...(hit.getAttribute?.('role') ? { role: hit.getAttribute('role') } : {}),
+                ...((hit.innerText || hit.getAttribute?.('aria-label') || '').trim()
+                  ? { text: (hit.innerText || hit.getAttribute?.('aria-label') || '').trim().slice(0, 120) }
+                  : {}),
+              } : undefined,
+            };
           }, { x: nativePoint.x - origin.x, y: nativePoint.y - origin.y });
-          if (!uncovered) throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'A paused iframe is outside the viewport or covered at the requested point.', 'Bring Chrome foreground and inspect a fresh snapshot or screenshot.');
+          if (!check.uncovered) {
+            throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'A paused iframe is outside the viewport or covered at the requested point.',
+              check.covered_by
+                ? 'Dismiss or scroll past the covering element in the parent page, then inspect a fresh snapshot.'
+                : 'Bring Chrome foreground and inspect a fresh snapshot or screenshot.',
+              check.covered_by ? { reason: 'covered', covered_by: check.covered_by } : undefined);
+          }
         } finally { release(host); release(parentHost); }
       }
     }
+    return nativePoint;
+  }
+
+  async click(page, target, timeout, { button = 'left', click_count = 1, modifiers = [] } = {}) {
+    // Android may suspend rendering while CDP evaluation and timers still work.
+    // Detect this before sending input; never retry a click that may have executed.
+    const framesRunning = await this.isRenderingRunning(target);
+    if (framesRunning) {
+      this.noteInput('click', this.register(page));
+      try {
+        return await target.click({ timeout, noWaitAfter: true, button, clickCount: click_count, modifiers });
+      } catch (error) {
+        if (/intercepts pointer events/i.test(error.message)) {
+          throw new ControlError('ELEMENT_NOT_ACTIONABLE', error.message,
+            'Another element (such as a modal, cookie banner, or sticky header) is covering this target. Dismiss or scroll past it, then inspect a fresh snapshot.',
+            { reason: 'covered' });
+        }
+        throw error;
+      }
+    }
+    const nativePoint = await this.resolvePausedPoint(page, target);
     this.noteInput('click', this.register(page));
-    await page.mouse.click(nativePoint.x, nativePoint.y);
+    for (const mod of modifiers) await page.keyboard.down(mod);
+    try {
+      await page.mouse.click(nativePoint.x, nativePoint.y, { button, clickCount: click_count });
+    } finally {
+      for (const mod of [...modifiers].reverse()) await page.keyboard.up(mod).catch(() => {});
+    }
+  }
+
+  async hover(page, target, timeout) {
+    const framesRunning = await this.isRenderingRunning(target);
+    if (framesRunning) {
+      this.noteInput('hover', this.register(page));
+      return target.hover({ timeout });
+    }
+    const nativePoint = await this.resolvePausedPoint(page, target);
+    this.noteInput('hover', this.register(page));
+    await page.mouse.move(nativePoint.x, nativePoint.y);
+  }
+
+  async fillTarget(page, target, text, timeout, { slowly = false, press_enter = false } = {}) {
+    const framesRunning = await this.isRenderingRunning(target);
+    if (framesRunning) {
+      if (slowly) {
+        await target.click({ timeout, noWaitAfter: true });
+        await target.fill('', { timeout });
+        if (text) await target.pressSequentially(text, { delay: 20, timeout });
+      } else {
+        await target.fill(text, { timeout });
+      }
+      if (press_enter) await target.press('Enter', { timeout, noWaitAfter: true });
+      return;
+    }
+    const updated = await target.evaluate((node, value) => {
+      if (!node.isConnected || node.matches(':disabled') || node.closest('[aria-disabled="true"], [inert]')) return false;
+      node.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+      node.focus();
+      if (node.isContentEditable) {
+        node.textContent = value;
+      } else {
+        const proto = node.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(node, value);
+        else node.value = value;
+      }
+      node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+      node.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }, text);
+    if (!updated) {
+      throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'The input target is detached or disabled while Chrome rendering is paused.',
+        'Bring Chrome foreground and inspect a fresh snapshot before trying again.');
+    }
+    if (press_enter) await page.keyboard.press('Enter');
+  }
+
+  async selectTarget(target, values, timeout) {
+    const framesRunning = await this.isRenderingRunning(target);
+    if (framesRunning) {
+      await target.selectOption(values, { timeout });
+      return;
+    }
+    const matched = await target.evaluate((node, wanted) => {
+      if (!node.isConnected || node.tagName !== 'SELECT' || node.matches(':disabled')) return false;
+      const set = new Set(wanted);
+      let any = false;
+      for (const option of Array.from(node.options)) {
+        const hit = set.has(option.value) || set.has(option.label) || set.has(option.textContent?.trim());
+        option.selected = hit;
+        if (hit) {
+          any = true;
+          if (!node.multiple) break;
+        }
+      }
+      if (any) {
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+        node.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      return any;
+    }, values);
+    if (!matched) {
+      throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'Could not select the requested option(s) while Chrome rendering is paused.',
+        'Verify option values or labels from a fresh snapshot.');
+    }
+  }
+
+  async drag(page, id, args, sourceTarget, timeout) {
+    let destTarget;
+    try {
+      const srcBox = await (async () => {
+        await sourceTarget.evaluate(node => node.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }));
+        return sourceTarget.boundingBox();
+      })();
+      if (!srcBox || srcBox.width <= 0 || srcBox.height <= 0) {
+        throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'The drag source element is not visible.', 'Scroll the element into view and inspect a fresh snapshot.');
+      }
+      const startX = srcBox.x + srcBox.width / 2;
+      const startY = srcBox.y + srcBox.height / 2;
+      let endX;
+      let endY;
+      if (args.target_ref) {
+        destTarget = await this.target(args.target_ref, page);
+        await destTarget.evaluate(node => node.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }));
+        const dstBox = await destTarget.boundingBox();
+        if (!dstBox || dstBox.width <= 0 || dstBox.height <= 0) {
+          throw new ControlError('ELEMENT_NOT_ACTIONABLE', 'The drag target element is not visible.', 'Scroll the target element into view and inspect a fresh snapshot.');
+        }
+        endX = dstBox.x + dstBox.width / 2;
+        endY = dstBox.y + dstBox.height / 2;
+      } else {
+        if (args.dx === undefined && args.dy === undefined) {
+          throw new ControlError('DRAG_TARGET_REQUIRED', 'Provide target_ref or dx/dy pixel offset for drag.', 'Pass target_ref for drag-and-drop, or dx/dy for dragging a slider or swiping.');
+        }
+        endX = startX + (args.dx ?? 0);
+        endY = startY + (args.dy ?? 0);
+      }
+      this.noteInput('drag', id);
+      await page.mouse.move(startX, startY);
+      await page.mouse.down();
+      await page.mouse.move(endX, endY, { steps: args.steps ?? 8 });
+      await page.mouse.up();
+    } finally {
+      release(destTarget);
+    }
   }
 
   async action(name, args) {
     const { page, id } = await this.page(args.tab_id);
     if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is blocking this tab.', 'Call browser_handle_dialog to accept or dismiss it.', { dialog: this.dialogInfo(page) });
+    const beforeTabIds = new Set(this.tabInfo.keys());
+    const beforeDownloads = (this.downloads.get(page) || []).length;
+    const prevSnapshot = name !== 'wait' ? this.lastSnapshotByTab.get(id) : null;
     let target;
     try {
-      if (args.ref) target = await this.target(args.ref, page);
+      const refValue = args.ref || args.source_ref;
+      if (refValue) target = await this.target(refValue, page);
       await this.perform(page, id, name, args, target);
       if (name !== 'wait') this.outcome.executed = true;
     } catch (error) {
@@ -1172,8 +1457,10 @@ export class BrowserController {
     } finally {
       release(target);
     }
-    await this.clearRefs();
-    return this.observe(page, id, { action: name, executed: true }, args.wait_for, name === 'wait', args.snapshot !== false);
+    if (!(name === 'wait' && args.snapshot === false)) await this.clearRefs();
+    return this.observe(page, id, { action: name, executed: true }, args.wait_for, name === 'wait', args.snapshot !== false, {
+      beforeTabIds, beforeDownloads, prevSnapshot,
+    });
   }
 
   async perform(page, id, name, args, target, timeout = this.config.actionTimeout) {
@@ -1182,17 +1469,19 @@ export class BrowserController {
     try {
       await this.untilDialog(page, async () => {
         this.assertActive();
-        if (!['click', 'wait'].includes(name)) this.noteInput(name, id);
+        if (!['click', 'hover', 'drag', 'wait'].includes(name)) this.noteInput(name, id);
         switch (name) {
-          case 'click': await this.click(page, target, timeout); break;
+          case 'click': await this.click(page, target, timeout, args); break;
+          case 'hover': await this.hover(page, target, timeout); break;
+          case 'drag': await this.drag(page, id, args, target, timeout); break;
           case 'fill': {
             const capture = this.flowCaptures.get(page);
             const isPassword = capture ? await target.evaluate(node => node.tagName === 'INPUT' && node.type === 'password').catch(() => false) : false;
-            await target.fill(args.text, { timeout });
+            await this.fillTarget(page, target, args.text, timeout, { slowly: args.slowly, press_enter: args.press_enter });
             capture?.noteInput(args.text, isPassword);
             break;
           }
-          case 'select': await target.selectOption(args.values, { timeout }); break;
+          case 'select': await this.selectTarget(target, args.values, timeout); break;
           case 'press':
             if (target) await target.press(args.key, { timeout, noWaitAfter: true });
             else await page.keyboard.press(args.key);
@@ -1205,6 +1494,8 @@ export class BrowserController {
             break;
           case 'navigate': await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout }); break;
           case 'back': await page.goBack({ waitUntil: 'domcontentloaded', timeout }); break;
+          case 'forward': await page.goForward({ waitUntil: 'domcontentloaded', timeout }); break;
+          case 'reload': await page.reload({ waitUntil: 'domcontentloaded', timeout }); break;
           case 'wait': if (!args.wait_for) await page.waitForTimeout(args.milliseconds); break;
           case 'tap': await page.mouse.click(args.x, args.y); break;
           default: throw new Error(`Unknown action: ${name}`);
@@ -1216,49 +1507,97 @@ export class BrowserController {
     } finally { if (name === 'click') page.off('filechooser', chooser); }
   }
 
-  async waitFor(page, condition) {
-    const timeout = condition.timeout_ms ?? 5000;
-    const frame = condition.frame_id ? page.frames()[Number(condition.frame_id.replace('frame_', ''))] : page.mainFrame();
-    if (!frame) throw new ControlError('FRAME_UNAVAILABLE', 'The wait frame no longer exists.', 'Inspect page_info() and use a current frame_id.');
-    try {
-      const handle = await frame.waitForFunction(({ text, text_absent, url, selector, state = 'visible' }) => {
-        const body = document.body?.innerText || '';
-        let ready = true;
-        if (selector) {
-          const node = document.querySelector(selector);
-          const box = node?.getBoundingClientRect();
-          const visible = !!(node && box.width && box.height &&
-            (node.checkVisibility ? node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : getComputedStyle(node).display !== 'none'));
-          ready = state === 'attached' ? !!node : state === 'hidden' ? !visible :
-            state === 'enabled' ? visible && !node.matches(':disabled') && !node.closest('[aria-disabled="true"],[inert]') : visible;
-        }
-        return (text === undefined || body.includes(text)) &&
-          (text_absent === undefined || !body.includes(text_absent)) &&
-          (url === undefined || location.href.includes(url)) && ready;
-      }, condition, { polling: 100, timeout });
-      release(handle);
-      return { matched: true };
-    } catch (error) {
-      this.assertActive();
-      if (error.name !== 'TimeoutError') throw error;
-      return { matched: false, timeout_ms: timeout, recovery: 'Inspect the returned snapshot. The action is not repeated when a condition times out.' };
+  async waitFor(page, condition, tabId) {
+    const timeout = Math.min(condition.timeout_ms ?? 5000, Math.max(5000, this.config.requestTimeout - 2000));
+    const started = Date.now();
+    const hasDomCondition = condition.text !== undefined || condition.text_absent !== undefined || condition.url !== undefined || condition.selector !== undefined;
+    if (hasDomCondition) {
+      const frame = condition.frame_id ? page.frames()[Number(condition.frame_id.replace('frame_', ''))] : page.mainFrame();
+      if (!frame) throw new ControlError('FRAME_UNAVAILABLE', 'The wait frame no longer exists.', 'Inspect page_info() and use a current frame_id.');
+      try {
+        const handle = await frame.waitForFunction(({ text, text_absent, url, selector, state = 'visible' }) => {
+          const collectText = () => {
+            const parts = [document.body?.innerText || ''];
+            const roots = [document];
+            for (let i = 0; i < roots.length; i++) {
+              for (const el of roots[i].querySelectorAll('*')) {
+                if (el.shadowRoot) {
+                  roots.push(el.shadowRoot);
+                  parts.push(Array.from(el.shadowRoot.children).map(child => child.innerText || '').join('\n'));
+                }
+              }
+            }
+            return parts.join('\n');
+          };
+          const body = (text !== undefined || text_absent !== undefined) ? collectText() : '';
+          let ready = true;
+          if (selector) {
+            const node = document.querySelector(selector);
+            const box = node?.getBoundingClientRect();
+            const visible = !!(node && box.width && box.height &&
+              (node.checkVisibility ? node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : getComputedStyle(node).display !== 'none'));
+            ready = state === 'attached' ? !!node : state === 'hidden' ? !visible :
+              state === 'enabled' ? visible && !node.matches(':disabled') && !node.closest('[aria-disabled="true"],[inert]') : visible;
+          }
+          return (text === undefined || body.includes(text)) &&
+            (text_absent === undefined || !body.includes(text_absent)) &&
+            (url === undefined || location.href.includes(url)) && ready;
+        }, condition, { polling: 100, timeout });
+        release(handle);
+      } catch (error) {
+        this.assertActive();
+        if (error.name !== 'TimeoutError') throw error;
+        return { matched: false, timeout_ms: timeout, recovery: 'Inspect the returned snapshot. The action is not repeated when a condition times out.' };
+      }
     }
+    if (condition.network_idle) {
+      const remaining = Math.max(100, timeout - (Date.now() - started));
+      const { stream } = await this.events(tabId || this.selected);
+      const idle = await stream.idle({ idle_ms: condition.idle_ms ?? 500, timeout_ms: remaining });
+      if (!idle.matched) return idle;
+    }
+    return { matched: true };
   }
 
-  async observe(page, id, output, condition, alreadyWaited = false, includeSnapshot = true) {
+  async observe(page, id, output, condition, alreadyWaited = false, includeSnapshot = true, meta = {}) {
     output.tab_id = id;
     if (!this.dialogs.has(page) && !this.fileChoosers.has(page)) {
       if (condition) {
-        try { output.wait = await this.waitFor(page, condition); }
+        try { output.wait = await this.waitFor(page, condition, id); }
         catch (error) { output.wait_error = describeError(error); }
       } else if (!alreadyWaited && includeSnapshot) await page.waitForTimeout(150);
     }
     this.assertActive();
     const chooser = this.fileChoosers.get(page);
     if (chooser) output.file_chooser = { multiple: chooser.isMultiple(), recovery: 'Call browser_upload with local file paths. The native file picker was intercepted.' };
+    if (meta.beforeTabIds) {
+      try {
+        await this.syncPages();
+        const opened = [];
+        for (const [tabId, info] of this.tabInfo) {
+          if (!meta.beforeTabIds.has(tabId)) {
+            opened.push({ tab_id: tabId, url: info.url, title: info.title || '(loading)' });
+          }
+        }
+        if (opened.length) {
+          output.new_tabs = opened;
+          output.new_tabs_hint = 'A new tab opened. Call browser_select_tab with its tab_id to inspect or interact with it.';
+        }
+      } catch {}
+    }
+    if (typeof meta.beforeDownloads === 'number') {
+      const allDownloads = this.downloads.get(page) || [];
+      const recent = allDownloads.slice(meta.beforeDownloads).map(({ download: _dl, ...info }) => info);
+      if (recent.length) {
+        output.downloads = recent;
+        output.downloads_hint = 'A file download started. Call browser_downloads to inspect or save it to a specific local path.';
+      }
+    }
     if (!includeSnapshot) return { ...output, refs_invalidated: !this.lastSnapshot };
     try {
-      return { ...output, snapshot: await this.snapshot({ tab_id: id }) };
+      const snap = await this.snapshot({ tab_id: id });
+      const changes = meta.prevSnapshot ? diffSnapshots(meta.prevSnapshot, this.lastSnapshotByTab.get(id)) : null;
+      return { ...output, ...(changes ? { changes } : {}), snapshot: snap };
     } catch (error) {
       return { ...output, observation_error: describeError(error), recovery: 'Inspect the page before repeating any completed actions.' };
     }
@@ -1267,6 +1606,9 @@ export class BrowserController {
   async batch({ tab_id, actions, wait_for, snapshot }) {
     const { page, id } = await this.page(tab_id);
     if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is blocking this tab.', 'Call browser_handle_dialog.');
+    const beforeTabIds = new Set(this.tabInfo.keys());
+    const beforeDownloads = (this.downloads.get(page) || []).length;
+    const prevSnapshot = this.lastSnapshotByTab.get(id);
     const targets = [];
     const results = [];
     let stop;
@@ -1314,7 +1656,9 @@ export class BrowserController {
       targets.forEach(({ node }) => release(node));
     }
     await this.clearRefs();
-    return this.observe(page, id, { action: 'batch', executed: results.length > 0, completed: results.length === actions.length, results, ...(stop ? { stopped: stop } : {}) }, wait_for, false, snapshot !== false);
+    return this.observe(page, id, { action: 'batch', executed: results.length > 0, completed: results.length === actions.length, results, ...(stop ? { stopped: stop } : {}) }, wait_for, false, snapshot !== false, {
+      beforeTabIds, beforeDownloads, prevSnapshot,
+    });
   }
 
   async upload({ tab_id, ref, paths, wait_for, snapshot }) {
@@ -1340,7 +1684,7 @@ export class BrowserController {
         }
         const buffer = await readFile(path);
         if (buffer.length !== metadata.size) throw new ControlError('UPLOAD_FILE_CHANGED', 'An upload file changed while being read.', 'Finish saving the file before uploading it.');
-        const mimeType = ({ '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json' })[extname(path).toLowerCase()] || 'application/octet-stream';
+        const mimeType = UPLOAD_MIME_TYPES[extname(path).toLowerCase()] || 'application/octet-stream';
         files.push({ name: basename(path), mimeType, buffer });
       }
       // Payloads work when Chrome and this Node process have different filesystems.
@@ -1355,10 +1699,12 @@ export class BrowserController {
     } finally { if (ref) release(target); }
   }
 
-  async screenshot({ tab_id, ref, full = false, max_dim } = {}) {
+  async screenshot({ tab_id, ref, full = false, max_dim, annotate = false } = {}) {
     const { page, id } = await this.page(tab_id);
     if (this.dialogs.has(page)) throw new ControlError('DIALOG_OPEN', 'A JavaScript dialog is open in this tab.', 'Read browser_snapshot, then call browser_handle_dialog.', { dialog: this.dialogInfo(page) });
     let target;
+    const annotatedFrames = [];
+    let annotatedMeta = {};
     try {
       if (ref && full) throw new ControlError('SCREENSHOT_SCOPE_INVALID', 'Choose an element crop or a full page screenshot.', 'Use ref for a crop, or full: true without ref.');
       let clip;
@@ -1372,6 +1718,21 @@ export class BrowserController {
           clip = { x, y, width: Math.min(viewport.width, box.x + box.width) - x, height: Math.min(viewport.height, box.y + box.height) - y };
         }
         if (!clip || clip.width <= 0 || clip.height <= 0) throw new ControlError('ELEMENT_NOT_VISIBLE', 'The screenshot target has no visible viewport area.', 'Scroll its parent into view and inspect a fresh snapshot.');
+      }
+      if (annotate) {
+        if (!this.lastSnapshot || this.lastSnapshot.tab_id !== id || !this.snapshotFrames.length) {
+          await this.snapshot({ tab_id: id });
+        }
+        let annotatedCount = 0;
+        for (const entry of this.snapshotFrames) {
+          if (entry.frame.isDetached() || !entry.labels?.length) continue;
+          try {
+            const count = await entry.nodes.evaluate(mountAnnotations, entry.labels);
+            annotatedFrames.push(entry.frame);
+            annotatedCount += Number(count) || 0;
+          } catch {}
+        }
+        annotatedMeta = { annotated: true, snapshot_id: this.lastSnapshot?.snapshot_id, annotated_count: annotatedCount };
       }
       if (full || max_dim) {
         let session;
@@ -1387,12 +1748,116 @@ export class BrowserController {
             format: 'jpeg', quality: 70, captureBeyondViewport: full, clip: { ...capture, scale: scale / deviceScale },
           }), this.config.actionTimeout);
           this.assertActive();
-          return { tab_id: id, url: page.url(), clip: capture, scale, full, data };
+          return { tab_id: id, url: page.url(), clip: capture, scale, full, ...annotatedMeta, data };
         } finally { session?.detach().catch(() => {}); }
       }
       const data = await page.screenshot({ type: 'jpeg', quality: 70, scale: 'css', fullPage: false, ...(clip ? { clip } : {}), timeout: this.config.actionTimeout });
-      return { tab_id: id, url: page.url(), ...(clip ? { clip } : {}), data: data.toString('base64') };
-    } finally { release(target); }
+      return { tab_id: id, url: page.url(), ...(clip ? { clip } : {}), ...annotatedMeta, data: data.toString('base64') };
+    } finally {
+      for (const frame of annotatedFrames) {
+        await frame.evaluate(unmountAnnotations).catch(() => {});
+      }
+      release(target);
+    }
+  }
+
+  async listOrSaveDownloads({ tab_id, operation = 'list', download_id, path } = {}) {
+    const { page, id } = await this.page(tab_id);
+    const records = this.downloads.get(page) || [];
+    const serialize = item => {
+      const { download: _dl, ...meta } = item;
+      return meta;
+    };
+    if (operation === 'list') {
+      return { tab_id: id, downloads: records.map(serialize) };
+    }
+    if (operation === 'save') {
+      if (!path || !isAbsolute(path)) {
+        throw new ControlError('DOWNLOAD_PATH_INVALID', 'Download output path must be an absolute local path.', 'Use the full path on the machine running the MCP server.');
+      }
+      const record = download_id
+        ? records.find(item => item.download_id === download_id)
+        : records.at(-1);
+      if (!record) {
+        throw new ControlError('DOWNLOAD_NOT_FOUND', 'No captured download was found for this tab.', 'Click a download link first, then call browser_downloads({ operation: "list" }).');
+      }
+      await withDeadline(() => record.download.saveAs(path), this.config.actionTimeout);
+      this.assertActive();
+      record.saved_path = path;
+      record.status = 'completed';
+      return { tab_id: id, saved: true, path, download: serialize(record) };
+    }
+    throw new ControlError('DOWNLOAD_OPERATION_INVALID', `Unknown download operation: ${operation}`, 'Use "list" or "save".');
+  }
+
+  async cookies({ tab_id, operation = 'get', name, value, url, domain, path, http_only, secure, same_site, expires } = {}) {
+    const { page, id } = await this.page(tab_id);
+    let session;
+    try {
+      session = await page.context().newCDPSession(page);
+      this.assertActive();
+      if (operation === 'get') {
+        const targetUrl = url || page.url();
+        const params = targetUrl && /^https?:\/\//i.test(targetUrl) ? { urls: [targetUrl] } : {};
+        const { cookies = [] } = await withDeadline(() => session.send('Network.getCookies', params), this.config.actionTimeout);
+        const filtered = name ? cookies.filter(c => c.name === name) : cookies;
+        return {
+          tab_id: id,
+          url: targetUrl,
+          cookies: filtered.slice(0, 200).map(c => ({
+            name: c.name, value: c.value, domain: c.domain, path: c.path,
+            http_only: Boolean(c.httpOnly), secure: Boolean(c.secure),
+            ...(c.sameSite ? { same_site: c.sameSite } : {}),
+            ...(c.expires && c.expires > 0 ? { expires: c.expires } : {}),
+            session: Boolean(c.session),
+          })),
+          truncated: filtered.length > 200,
+        };
+      }
+      if (operation === 'set') {
+        if (!name || value === undefined) {
+          throw new ControlError('COOKIE_ARGUMENTS_INVALID', 'Cookie name and value are required for operation: "set".', 'Pass both name and value.');
+        }
+        const targetUrl = url || (!domain ? page.url() : undefined);
+        this.noteInput('cookies', id);
+        const { success } = await withDeadline(() => session.send('Network.setCookie', {
+          name, value,
+          ...(targetUrl ? { url: targetUrl } : {}),
+          ...(domain ? { domain } : {}),
+          ...(path ? { path } : {}),
+          ...(typeof http_only === 'boolean' ? { httpOnly: http_only } : {}),
+          ...(typeof secure === 'boolean' ? { secure } : {}),
+          ...(same_site ? { sameSite: same_site } : {}),
+          ...(typeof expires === 'number' ? { expires } : {}),
+        }), this.config.actionTimeout);
+        this.outcome.executed = true;
+        return { tab_id: id, set: Boolean(success), name };
+      }
+      if (operation === 'delete') {
+        if (!name) {
+          throw new ControlError('COOKIE_ARGUMENTS_INVALID', 'Cookie name is required for operation: "delete".', 'Pass the cookie name to delete.');
+        }
+        const targetUrl = url || (!domain ? page.url() : undefined);
+        this.noteInput('cookies', id);
+        await withDeadline(() => session.send('Network.deleteCookies', {
+          name,
+          ...(targetUrl ? { url: targetUrl } : {}),
+          ...(domain ? { domain } : {}),
+          ...(path ? { path } : {}),
+        }), this.config.actionTimeout);
+        this.outcome.executed = true;
+        return { tab_id: id, deleted: true, name };
+      }
+      if (operation === 'clear') {
+        this.noteInput('cookies', id);
+        await withDeadline(() => session.send('Network.clearBrowserCookies'), this.config.actionTimeout);
+        this.outcome.executed = true;
+        return { tab_id: id, cleared: true };
+      }
+      throw new ControlError('COOKIE_OPERATION_INVALID', `Unknown cookie operation: ${operation}`, 'Use "get", "set", "delete", or "clear".');
+    } finally {
+      session?.detach().catch(() => {});
+    }
   }
 
   async evaluate({ expression, tab_id, frame_id, snapshot }) {

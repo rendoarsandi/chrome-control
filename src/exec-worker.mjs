@@ -74,11 +74,84 @@ for (const name of workerData.helpers) Object.defineProperty(session.context, na
     return promise;
   },
 });
+const matchElements = (elements, query, options = {}) => {
+  const { role, tag, in_viewport, frame_id } = options;
+  const roleFilter = role ? String(role).toLowerCase() : null;
+  const tagFilter = tag ? String(tag).toLowerCase() : null;
+  const isRegex = query instanceof RegExp;
+  const needle = !isRegex && query !== undefined && query !== null ? String(query).trim().toLowerCase() : null;
+  const scored = [];
+  for (const el of elements || []) {
+    if (roleFilter && String(el.role || '').toLowerCase() !== roleFilter) continue;
+    if (tagFilter && String(el.tag || '').toLowerCase() !== tagFilter) continue;
+    if (typeof in_viewport === 'boolean' && el.in_viewport !== in_viewport) continue;
+    if (frame_id && el.frame_id !== frame_id) continue;
+    const fields = [el.name || '', el.placeholder || '', el.value || '', el.href || ''];
+    if (isRegex) {
+      if (!fields.some(f => query.test(f))) continue;
+      scored.push({ el, score: query.test(el.name || '') ? 2 : 1 });
+    } else if (needle) {
+      const nameLower = String(el.name || '').trim().toLowerCase();
+      if (nameLower === needle) scored.push({ el, score: 4 });
+      else if (nameLower.startsWith(needle)) scored.push({ el, score: 3 });
+      else if (nameLower.includes(needle)) scored.push({ el, score: 2 });
+      else if (fields.some(f => String(f).toLowerCase().includes(needle))) scored.push({ el, score: 1 });
+    } else {
+      scored.push({ el, score: 1 });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score || (b.el.in_viewport ? 1 : 0) - (a.el.in_viewport ? 1 : 0));
+  return scored.map(item => item.el);
+};
+const resolveSnapshotElements = async options => {
+  if (options?.from_snapshot?.elements) return options.from_snapshot;
+  return session.context.page_info();
+};
+Object.defineProperties(session.context, {
+  find_elements: { value: async (query, options = {}) => {
+    const snap = await resolveSnapshotElements(options);
+    return matchElements(snap.elements, query, options);
+  } },
+  find_element: { value: async (query, options = {}) => {
+    const snap = await resolveSnapshotElements(options);
+    return matchElements(snap.elements, query, options)[0] || null;
+  } },
+  click_text: { value: async (query, options = {}) => {
+    const { role, tag, in_viewport, frame_id, from_snapshot, ...actionOptions } = options || {};
+    const snap = await resolveSnapshotElements({ from_snapshot });
+    const matches = matchElements(snap.elements, query, { role, tag, in_viewport, frame_id });
+    if (!matches.length) {
+      const sample = (snap.elements || []).filter(e => e.name).slice(0, 10).map(e => `${e.role}:"${e.name}"`).join(', ');
+      throw Object.assign(new Error(`No element matched "${query}". Available: ${sample || '(none)'}`), {
+        code: 'ELEMENT_NOT_FOUND',
+        recovery: 'Inspect page_info() for exact element names and roles, or scroll to reveal the control.',
+      });
+    }
+    return session.context.click(matches[0].ref, actionOptions);
+  } },
+  fill_label: { value: async (query, text, options = {}) => {
+    const { role, tag, in_viewport, frame_id, from_snapshot, ...actionOptions } = options || {};
+    const snap = await resolveSnapshotElements({ from_snapshot });
+    const fillableRoles = new Set(['textbox', 'searchbox', 'spinbutton', 'combobox']);
+    const candidates = role || tag
+      ? snap.elements
+      : (snap.elements || []).filter(e => fillableRoles.has(String(e.role || '').toLowerCase()) || ['input', 'textarea'].includes(e.tag));
+    const matches = matchElements(candidates, query, { role, tag, in_viewport, frame_id });
+    if (!matches.length) {
+      const sample = candidates.filter(e => e.name).slice(0, 10).map(e => `${e.role}:"${e.name}"`).join(', ');
+      throw Object.assign(new Error(`No fillable element matched "${query}". Available inputs: ${sample || '(none)'}`), {
+        code: 'ELEMENT_NOT_FOUND',
+        recovery: 'Inspect page_info() for exact input labels and refs.',
+      });
+    }
+    return session.context.fill(matches[0].ref, text, actionOptions);
+  } },
+});
 const serialize = value => {
   if (value === undefined) return {};
   try {
     const text = JSON.stringify(value, (_key, item) => active?.summarizeSnapshots && item?.snapshot_id &&
-      Array.isArray(item.frames) && Array.isArray(item.elements)
+      Array.isArray(item.frames) && (Array.isArray(item.elements) || typeof item.elements_text === 'string')
       ? { snapshot_reference: item.snapshot_id, tab_id: item.tab_id } : item);
     if (text === undefined) return { result_text: String(value).slice(0, 20000) };
     return text.length > 20000

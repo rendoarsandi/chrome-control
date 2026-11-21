@@ -23,6 +23,7 @@ Configuration:
   CHROME_REQUEST_TIMEOUT_MS Default: 30000
   CHROME_TOOL_MODE          full (default) or compact for three MCP tools
   CHROME_HELPER_FILES       JSON array of absolute JS helper file paths
+  CHROME_FLOW_DIR           Optional absolute directory to persist browser_flow JSON files
 
 See README.md for Termux setup and Codex/Claude Code/client configuration.`);
 } else if (args.some(arg => arg !== '--stdio')) {
